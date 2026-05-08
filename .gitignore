@@ -1,0 +1,10 @@
+fon.dat
+reports/*
+.env
+__pycache__/
+*.pyc
+reports/*.pdf
+reports/_*.png
+!reports/.gitkeep
+_chart_tmp.png
+.DS_Store

@@ -1,0 +1,25 @@
+services:
+  tefas:
+    build: .
+    container_name: tefas
+    profiles: [job]
+    env_file: .env
+    volumes:
+      - ./fon.dat:/app/fon.dat:ro
+      - ./reports:/app/reports
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+  scheduler:
+    image: mcuadros/ofelia:latest
+    container_name: tefas-scheduler
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: daemon --docker
+    labels:
+      ofelia.job-run.tefas-report.schedule: "0 11 * * 1-5"
+      ofelia.job-run.tefas-report.container: "tefas"
