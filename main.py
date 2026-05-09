@@ -163,10 +163,24 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Re-generate today's report even if it already exists")
+    parser.add_argument("--date", help="Run for a specific date (YYYY-MM-DD) instead of today")
     args = parser.parse_args()
 
     holdings = read_portfolio("fon.dat")
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    if args.date:
+        try:
+            today = datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            print(f"Invalid date format: {args.date!r} — expected YYYY-MM-DD")
+            return
+    else:
+        today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+
+    if today.weekday() >= 5 and not args.force:  # 5=Saturday, 6=Sunday
+        day_name = "Saturday" if today.weekday() == 5 else "Sunday"
+        print(f"{today_str} is a {day_name} — TEFAS is closed. Skipping. (use --force to override)")
+        return
 
     # Skip if today's report already exists in history AND PDF was generated
     existing = read_history()

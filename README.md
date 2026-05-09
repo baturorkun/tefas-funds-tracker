@@ -56,7 +56,15 @@ python main.py
 
 # Force re-run if today's report already exists
 python main.py --force
+
+# Run for a specific past date
+python main.py --date 2026-05-07
+
+# Run for a specific date and force re-generation
+python main.py --date 2026-05-07 --force
 ```
+
+> **Weekend guard** — The script skips automatically on Saturdays and Sundays since TEFAS is closed. Use `--force` to override (e.g. for backfilling a past weekend date).
 
 ### 4. Run with Docker
 
