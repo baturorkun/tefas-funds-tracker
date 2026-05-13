@@ -8,3 +8,5 @@ reports/_*.png
 !reports/.gitkeep
 _chart_tmp.png
 .DS_Store
+Plans.md
+Settings.json
