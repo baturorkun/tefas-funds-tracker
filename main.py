@@ -171,6 +171,33 @@ def read_history():
     return entries
 
 
+def compute_daily_return_series(entries):
+    """
+    Compute cash-flow-adjusted daily returns from history-like entries.
+    Each entry must have: date, cost, current.
+    Returns list of dicts for days where previous day exists:
+    {date, daily_gain, daily_pct, new_capital}
+    """
+    if not entries or len(entries) < 2:
+        return []
+
+    ordered = sorted(entries, key=lambda x: x["date"])
+    series = []
+    for i in range(1, len(ordered)):
+        prev = ordered[i - 1]
+        cur = ordered[i]
+        new_capital = cur["cost"] - prev["cost"]
+        daily_gain = (cur["current"] - prev["current"]) - new_capital
+        daily_pct = (daily_gain / prev["current"] * 100) if prev["current"] else 0.0
+        series.append({
+            "date": cur["date"],
+            "daily_gain": daily_gain,
+            "daily_pct": daily_pct,
+            "new_capital": new_capital,
+        })
+    return series
+
+
 def generate_history_chart(history, days=30):
     import os
     import matplotlib
@@ -188,7 +215,11 @@ def generate_history_chart(history, days=30):
     labels   = [e["date"][5:] for e in recent]   # MM-DD
     xs       = list(range(len(recent)))
     currents = [e["current"] / 1000 for e in recent]
-    pnl_pcts = [e["pnl_pct"] for e in recent]
+
+    # Daily return bars should be cash-flow-adjusted (so red/green days are visible)
+    daily_series = compute_daily_return_series(recent)
+    daily_by_date = {d["date"]: d for d in daily_series}
+    daily_pcts = [daily_by_date.get(e["date"], {"daily_pct": 0.0})["daily_pct"] for e in recent]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 4.5), sharex=True,
                                     gridspec_kw={"height_ratios": [2, 1]})
@@ -201,10 +232,10 @@ def generate_history_chart(history, days=30):
     ax1.grid(True, alpha=0.3, linestyle="--")
     ax1.set_title("Portfolio Performance — Last 30 Days", fontsize=10, pad=6)
 
-    bar_colors = ["#1a7a1a" if p >= 0 else "#c00000" for p in pnl_pcts]
-    ax2.bar(xs, pnl_pcts, color=bar_colors, width=0.7, zorder=3)
+    bar_colors = ["#1a7a1a" if p >= 0 else "#c00000" for p in daily_pcts]
+    ax2.bar(xs, daily_pcts, color=bar_colors, width=0.7, zorder=3)
     ax2.axhline(0, color="black", linewidth=0.6)
-    ax2.set_ylabel("Total Return %")
+    ax2.set_ylabel("Daily Return %")
     ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:+.1f}%"))
     ax2.grid(True, alpha=0.3, linestyle="--")
 
@@ -398,7 +429,8 @@ def main():
     print("-" * 135)
     avg_1m_str = f"{(_1m_weighted_pct / _1m_weight_sum):+.2f}%" if _1m_weight_sum else "—"
     avg_3m_str = f"{(_3m_weighted_pct / _3m_weight_sum):+.2f}%" if _3m_weight_sum else "—"
-    print(col2.format("TOTAL", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%"))
+    fund_count = len(fund_summary)
+    print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%"))
 
     print(f"\n  Total Invested : {total_cost:>14,.0f} TL")
     print(f"  Current Value  : {total_current:>14,.0f} TL")
@@ -418,6 +450,20 @@ def main():
             yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
             yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
             print(f"  Yesterday's Return: {yest_daily_pct:>+10.4f}%  ({prev2['date']} → {prev['date']})")
+
+    # Show recent daily returns so negative days are clearly visible
+    history_with_today = history + [{
+        "date": today_str,
+        "cost": total_cost,
+        "current": total_current,
+        "pnl": total_pnl,
+        "pnl_pct": total_pnl_pct,
+    }]
+    recent_daily = compute_daily_return_series(history_with_today)[-7:]
+    if recent_daily:
+        print("\n  Recent Daily Returns (cash-flow adjusted):")
+        for d in recent_daily:
+            print(f"    {d['date']}: {d['daily_pct']:+.4f}%  ({d['daily_gain']:+,.0f} TL)")
     print()
 
     if missing_prices:
@@ -617,8 +663,9 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     avg_1m_cell = pnl_para(f"{avg_1m_pdf:+.2f}%", avg_1m_pdf, bold=True) if avg_1m_pdf is not None else td("—", align="RIGHT")
     avg_3m_pdf = (_pdf_3m_weighted_pct / _pdf_3m_weight_sum) if _pdf_3m_weight_sum else None
     avg_3m_cell = pnl_para(f"{avg_3m_pdf:+.2f}%", avg_3m_pdf, bold=True) if avg_3m_pdf is not None else td("—", align="RIGHT")
+    fund_count = len(fund_summary)
     fund_rows.append([
-        td("TOTAL", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), tdr("100.0%", bold=True),
+        td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), tdr("100.0%", bold=True),
         tdr(f"{total_cost:,.0f}", bold=True),
         tdr(f"{total_current:,.0f}", bold=True),
         pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
@@ -694,8 +741,9 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                             tdr(f"{shares:,}"),
                             td("?"), td("?"), td("?"), td("?"), td("?"), td("?"),
                             td("⚠ no price")])
+    tx_count = len(holdings)
     tx_rows.append([
-        td("TOTAL", bold=True), td(""), td(""), td(""), td(""), td(""),
+        td(f"TOTAL ({tx_count})", bold=True), td(""), td(""), td(""), td(""), td(""),
         tdr(f"{total_cost:,.0f}", bold=True),
         tdr(f"{total_current:,.0f}", bold=True),
         pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
