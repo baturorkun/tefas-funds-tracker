@@ -137,6 +137,99 @@ def fund_3month_return(prices):
     return pct, today_price, price_3m
 
 
+def fund_6month_return(prices):
+    """
+    Returns (pct, today_price, price_6m_ago) for the ~180-day window.
+    Uses forward-looking date resolution to match TEFAS website methodology.
+    pct is None when insufficient data.
+    """
+    if not prices:
+        return None, None, None
+    sorted_dates = sorted(prices.keys())
+    today_date = datetime.strptime(sorted_dates[-1], "%Y-%m-%d")
+    target_6m = today_date - timedelta(days=180)
+    price_6m, _ = find_closest_price_forward(prices, target_6m.strftime("%Y-%m-%d"))
+    today_price = prices[sorted_dates[-1]]
+    if price_6m is None or price_6m == 0:
+        return None, today_price, None
+    pct = (today_price - price_6m) / price_6m * 100
+    return pct, today_price, price_6m
+
+
+def build_fund_rankings(fund_summary, fund_data, top_n=5):
+    horizons = [
+        ("1M", fund_monthly_return),
+        ("3M", fund_3month_return),
+        ("6M", fund_6month_return),
+    ]
+    rankings = {}
+    for term, return_fn in horizons:
+        ranked = []
+        for code, s in fund_summary.items():
+            prices, _ = fund_data.get(code, ({}, code))
+            ret_pct, _, _ = return_fn(prices)
+            if ret_pct is None:
+                continue
+            ranked.append({
+                "code": code,
+                "name": s.get("name", code),
+                "ret_pct": ret_pct,
+                "current": s.get("current", 0.0),
+            })
+        ranked_desc = sorted(ranked, key=lambda x: x["ret_pct"], reverse=True)
+        ranked_asc = sorted(ranked, key=lambda x: x["ret_pct"])
+        rankings[term] = {
+            "top": ranked_desc[:top_n],
+            "bottom": ranked_asc[:top_n],
+        }
+    return rankings
+
+
+def print_fund_performance_rankings(fund_summary, fund_data, top_n=5):
+    """
+    Prints console tables with top/bottom performers for 1M, 3M and 6M returns.
+    """
+    rankings = build_fund_rankings(fund_summary, fund_data, top_n=top_n)
+    row = "{:<6} {:<48} {:>10} {:>14}"
+
+    print("\n" + "=" * 115)
+    print("TOP 5 PERFORMERS")
+    for term in ("1M", "3M", "6M"):
+        print(f"\n{term} TOP 5")
+        print(row.format("Fund", "Fund Name", "Return", "Cur. Value"))
+        print("-" * 90)
+        top_rows = rankings[term]["top"]
+        if not top_rows:
+            print("No data available for this term.")
+            continue
+        for r in top_rows:
+            print(row.format(
+                r["code"],
+                r["name"][:48],
+                f"{r['ret_pct']:+.2f}%",
+                f"{r['current']:,.0f}",
+            ))
+
+    print("\n" + "=" * 115)
+    print("BOTTOM 5 PERFORMERS")
+    for term in ("1M", "3M", "6M"):
+        print(f"\n{term} BOTTOM 5")
+        print(row.format("Fund", "Fund Name", "Return", "Cur. Value"))
+        print("-" * 90)
+        bottom_rows = rankings[term]["bottom"]
+        if not bottom_rows:
+            print("No data available for this term.")
+            continue
+        for r in bottom_rows:
+            print(row.format(
+                r["code"],
+                r["name"][:48],
+                f"{r['ret_pct']:+.2f}%",
+                f"{r['current']:,.0f}",
+            ))
+    print("=" * 115)
+
+
 def save_history(date_str, total_cost, total_current, total_pnl, total_pnl_pct):
     import os
     path = os.path.join("reports", "history.tsv")
@@ -306,6 +399,25 @@ def main():
         else:
             print("NO DATA")
 
+    # ── Benchmark fund ─────────────────────────────────────────────────────────
+    benchmark_code = os.environ.get("BENCHMARK_FUND", "").strip().upper()
+    bench_prices = {}
+    bench_name = ""
+    use_benchmark = False
+    if benchmark_code:
+        if benchmark_code in fund_data:
+            bench_prices, bench_name = fund_data[benchmark_code]
+            use_benchmark = True
+        else:
+            print(f"  [{benchmark_code}] (benchmark) ", end="", flush=True)
+            bench_prices, bench_name = get_fund_prices(benchmark_code)
+            if bench_prices:
+                latest_date = max(bench_prices.keys())
+                print(f"{bench_name[:50]:<52} — {len(bench_prices)} days, latest: {latest_date} = {bench_prices[latest_date]:.6f}")
+                use_benchmark = True
+            else:
+                print("NO DATA")
+
     print()
 
     # ── Per-transaction table ──────────────────────────────────────────────────
@@ -320,7 +432,10 @@ def main():
 
     total_cost = 0.0
     total_current = 0.0
+    total_bench_current = 0.0
+    today_capital = 0.0
     missing_prices = []
+    bench_rows = []
 
     # For per-fund summary
     fund_summary = defaultdict(lambda: {"cost": 0.0, "current": 0.0, "shares": 0, "name": ""})
@@ -336,11 +451,8 @@ def main():
         # Buy price: exact date or nearest previous trading day
         buy_price, used_buy_date = find_closest_price(prices, buy_date)
 
-        # Current price: latest available
-        current_price, latest_date = (None, None)
-        if prices:
-            latest_date = max(prices.keys())
-            current_price = prices[latest_date]
+        # Current price: price on the target date (or nearest previous trading day)
+        current_price, latest_date = find_closest_price(prices, today_str)
 
         if buy_price is not None and current_price is not None:
             cost = buy_price * shares
@@ -350,6 +462,17 @@ def main():
 
             total_cost += cost
             total_current += current_val
+            if buy_date == today_str:
+                today_capital += cost
+            # Benchmark
+            bench_cur = None
+            if use_benchmark:
+                bench_bp, _ = find_closest_price(bench_prices, buy_date)
+                bench_tp, _ = find_closest_price(bench_prices, today_str)
+                if bench_bp and bench_tp and bench_bp > 0:
+                    bench_cur = (cost / bench_bp) * bench_tp
+                    total_bench_current += bench_cur
+            bench_rows.append((bank, code, buy_date, cost, bench_cur, current_val))
             fund_summary[code]["cost"] += cost
             fund_summary[code]["current"] += current_val
             fund_summary[code]["shares"] += shares
@@ -382,13 +505,43 @@ def main():
         f"{total_cost:,.0f}", f"{total_current:,.0f}",
         f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%"
     ))
-
+    # ── Benchmark comparison table ─────────────────────────────────────────────────────
+    if use_benchmark and any(r[4] is not None for r in bench_rows):
+        bench_pnl_total = total_bench_current - total_cost
+        bench_pnl_pct_total = (bench_pnl_total / total_cost * 100) if total_cost else 0.0
+        total_vs_bench = total_current - total_bench_current
+        vs_bench_pct_total = (total_vs_bench / total_bench_current * 100) if total_bench_current else 0.0
+        print(f"\nBENCHMARK — [{benchmark_code}] {bench_name[:55]}")
+        bcol = "{:<10} {:<5} {:<13} {:>14} {:>14} {:>14} {:>9}"
+        print(bcol.format("Bank", "Fund", "Buy Date", "Buy Value", "Bench Val", "vs Bench", "vs Bench%"))
+        print("-" * 93)
+        for bank_, code_, bdate_, cost_, bench_cur_, cur_val_ in bench_rows:
+            if bench_cur_ is not None:
+                vs = cur_val_ - bench_cur_
+                vs_pct = (vs / bench_cur_ * 100) if bench_cur_ else 0.0
+                print(bcol.format(bank_, code_, bdate_, f"{cost_:,.0f}", f"{bench_cur_:,.0f}", f"{vs:+,.0f}", f"{vs_pct:+.2f}%"))
+            else:
+                print(bcol.format(bank_, code_, bdate_, f"{cost_:,.0f}", "?", "?", "?"))
+        print("-" * 93)
+        print(bcol.format("TOTAL", "", "", f"{total_cost:,.0f}", f"{total_bench_current:,.0f}", f"{total_vs_bench:+,.0f}", f"{vs_bench_pct_total:+.2f}%"))
     # ── Per-fund summary ───────────────────────────────────────────────────────
-    print("\n" + "=" * 135)
+    # Aggregate benchmark values per fund
+    fund_bench: dict = {}
+    if use_benchmark:
+        for _, _fc, _, _, _bc, _ in bench_rows:
+            if _bc is not None:
+                fund_bench[_fc] = fund_bench.get(_fc, 0.0) + _bc
+    _bench_cols = use_benchmark and bool(fund_bench)
+    sep_w = 171 if _bench_cols else 135
+    print("\n" + "=" * sep_w)
     print("FUND SUMMARY\n")
-    col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>8}"
-    print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "P&L %"))
-    print("-" * 135)
+    if _bench_cols:
+        col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>14} {:>10} {:>9} {:>8}"
+        print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "Bench Val", "vs Bench", "vs Bnch%", "P&L %"))
+    else:
+        col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>8}"
+        print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "P&L %"))
+    print("-" * sep_w)
     # Collect 1M and 3M data for weighted averages
     _1m_weight_sum = 0.0
     _1m_weighted_pct = 0.0
@@ -419,37 +572,64 @@ def main():
         if m3_pct is not None and s["current"] > 0:
             _3m_weight_sum += s["current"]
             _3m_weighted_pct += m3_pct * s["current"]
-        print(col2.format(
-            code, s["name"][:50],
-            daily_pct_str, m_pct_str, m3_pct_str,
-            f"{s['shares']:,}",
-            f"{s['cost']:,.0f}", f"{s['current']:,.0f}",
-            f"{pnl:+,.0f}", f"{pct:+.2f}%"
-        ))
-    print("-" * 135)
+        if _bench_cols:
+            b_cur = fund_bench.get(code, 0.0)
+            vs_b = s["current"] - b_cur if b_cur else None
+            vs_b_pct = (vs_b / b_cur * 100) if b_cur else None
+            print(col2.format(
+                code, s["name"][:50],
+                daily_pct_str, m_pct_str, m3_pct_str,
+                f"{s['shares']:,}",
+                f"{s['cost']:,.0f}", f"{s['current']:,.0f}",
+                f"{pnl:+,.0f}",
+                f"{b_cur:,.0f}" if b_cur else "?",
+                f"{vs_b:+,.0f}" if vs_b is not None else "?",
+                f"{vs_b_pct:+.2f}%" if vs_b_pct is not None else "?",
+                f"{pct:+.2f}%"
+            ))
+        else:
+            print(col2.format(
+                code, s["name"][:50],
+                daily_pct_str, m_pct_str, m3_pct_str,
+                f"{s['shares']:,}",
+                f"{s['cost']:,.0f}", f"{s['current']:,.0f}",
+                f"{pnl:+,.0f}", f"{pct:+.2f}%"
+            ))
+    print("-" * sep_w)
     avg_1m_str = f"{(_1m_weighted_pct / _1m_weight_sum):+.2f}%" if _1m_weight_sum else "—"
     avg_3m_str = f"{(_3m_weighted_pct / _3m_weight_sum):+.2f}%" if _3m_weight_sum else "—"
     fund_count = len(fund_summary)
-    print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%"))
+    if _bench_cols:
+        bench_vs = total_current - total_bench_current
+        bench_vs_pct = (bench_vs / total_bench_current * 100) if total_bench_current else 0.0
+        print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_bench_current:,.0f}", f"{bench_vs:+,.0f}", f"{bench_vs_pct:+.2f}%", f"{total_pnl_pct:+.2f}%"))
+    else:
+        print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%"))
 
     print(f"\n  Total Invested : {total_cost:>14,.0f} TL")
     print(f"  Current Value  : {total_current:>14,.0f} TL")
     print(f"  Total P&L      : {total_pnl:>+14,.0f} TL  ({total_pnl_pct:+.2f}%)")
-
+    if use_benchmark and total_bench_current > 0:
+        bench_pnl = total_bench_current - total_cost
+        bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
+        vs_bench = total_current - total_bench_current
+        vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
+        print(f"  Benchmark [{benchmark_code}]  : {total_bench_current:>14,.0f} TL  ({bench_pnl_pct:+.2f}%)")
+        print(f"  vs Benchmark   : {vs_bench:>+14,.0f} TL  ({vs_bench_pct:+.2f}%)")
     # ── Daily returns (today and yesterday) ────────────────────────────────────
     history = [e for e in existing if e["date"] < today_str]  # exclude today
     if history:
         prev = history[-1]
-        new_capital = total_cost - prev["cost"]
+        new_capital = today_capital
         today_gain = (total_current - prev["current"]) - new_capital
         today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
-        print(f"\n  Today's Daily Return: {today_daily_pct:>+10.4f}%  ({prev['date']} \u2192 {today_str})")
+        print(f"\n  Today's Daily Return: {today_daily_pct:>+7.2f}%  ({prev['date']} \u2192 {today_str})")
         if len(history) >= 2:
             prev2 = history[-2]
             yest_new_capital = prev["cost"] - prev2["cost"]
             yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
             yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
-            print(f"  Yesterday's Return: {yest_daily_pct:>+10.4f}%  ({prev2['date']} → {prev['date']})")
+            print(f"  Yesterday's Return: {yest_daily_pct:>+7.2f}%  ({prev2['date']} → {prev['date']})")
 
     # Show recent daily returns so negative days are clearly visible
     history_with_today = history + [{
@@ -463,7 +643,7 @@ def main():
     if recent_daily:
         print("\n  Recent Daily Returns (cash-flow adjusted):")
         for d in recent_daily:
-            print(f"    {d['date']}: {d['daily_pct']:+.4f}%  ({d['daily_gain']:+,.0f} TL)")
+            print(f"    {d['date']}: {d['daily_pct']:+.2f}%  ({d['daily_gain']:+,.0f} TL)")
     print()
 
     if missing_prices:
@@ -473,16 +653,22 @@ def main():
     print()
 
     save_history(today_str, total_cost, total_current, total_pnl, total_pnl_pct)
+    print_fund_performance_rankings(fund_summary, fund_data, top_n=3)
     write_pdf_report(
         holdings, fund_data, fund_summary,
         total_cost, total_current, total_pnl, total_pnl_pct,
-        missing_prices, today_str,
+        missing_prices, today_str, today_capital,
+        benchmark_code=benchmark_code, bench_name=bench_name,
+        total_bench_current=total_bench_current,
+        fund_bench=fund_bench,
     )
 
 
 def write_pdf_report(holdings, fund_data, fund_summary,
                      total_cost, total_current, total_pnl, total_pnl_pct,
-                     missing_prices, today_str):
+                     missing_prices, today_str, today_capital=0.0,
+                     benchmark_code="", bench_name="", total_bench_current=0.0,
+                     fund_bench=None):
     # ── Register fonts ─────────────────────────────────────────────────────────
     font_paths = [
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -569,12 +755,20 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         [td("Current Value"),   tdr(f"{total_current:,.0f} TL")],
         [td("Total P&L"), pnl_para(pnl_str, total_pnl, bold=True)],
     ]
+    if benchmark_code and total_bench_current > 0:
+        bench_pnl = total_bench_current - total_cost
+        bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
+        vs_bench = total_current - total_bench_current
+        vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
+        summary_data.append([td(f"Benchmark [{benchmark_code}]"), tdr(f"{total_bench_current:,.0f} TL  ({bench_pnl_pct:+.2f}%)")])
+        vs_bench_str = f"{vs_bench:+,.0f} TL  ({vs_bench_pct:+.2f}%)"
+        summary_data.append([td("  ↳ vs Benchmark"), pnl_para(vs_bench_str, vs_bench)])
     if today_entry and prev_entries:
         prev = prev_entries[-1]
-        new_capital = today_entry["cost"] - prev["cost"]
+        new_capital = today_capital
         today_gain = (today_entry["current"] - prev["current"]) - new_capital
         today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
-        today_daily_str = f"{today_daily_pct:+.4f}%  (vs {prev['date']})"
+        today_daily_str = f"{today_daily_pct:+.2f}%  (vs {prev['date']})"
         summary_data.append([td("Today's Daily Return"), pnl_para(today_daily_str, today_daily_pct, bold=True)])
         if new_capital > 0.01:
             summary_data.append([td("  ↳ New Capital Today"), tdr(f"+{new_capital:,.0f} TL")])
@@ -583,7 +777,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             yest_new_capital = prev["cost"] - prev2["cost"]
             yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
             yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
-            yest_daily_str = f"{yest_daily_pct:+.4f}%  (vs {prev2['date']})"
+            yest_daily_str = f"{yest_daily_pct:+.2f}%  (vs {prev2['date']})"
             summary_data.append([td("Yesterday's Return"), pnl_para(yest_daily_str, yest_daily_pct)])
             if yest_new_capital > 0.01:
                 summary_data.append([td("  ↳ New Capital Yesterday"), tdr(f"+{yest_new_capital:,.0f} TL")])
@@ -604,9 +798,15 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     # ── Fund summary table ─────────────────────────────────────────────────────
     story.append(Paragraph("Fund Summary", heading_style))
     story.append(Spacer(1, 0.2*cm))
-    fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Shares"), th("Portfolio %"),
-                   th("Buy Value (TL)"), th("Cur. Value (TL)"),
-                   th("P&L (TL)"), th("P&L %")]
+    _pdf_bench = fund_bench if fund_bench else {}
+    if _pdf_bench:
+        fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Shares"),
+                       th("Buy Value"), th("Cur. Value"), th("P&L"), th("P&L %"),
+                       th("Bench Val"), th("vs Bench"), th("vs Bnch%")]
+    else:
+        fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Shares"), th("Portfolio %"),
+                       th("Buy Value"), th("Cur. Value"),
+                       th("P&L"), th("P&L %")]
     fund_rows = [fund_header]
     _pdf_1m_weight_sum = 0.0
     _pdf_1m_weighted_pct = 0.0
@@ -646,32 +846,67 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         else:
             m3_cell = td("—", align="RIGHT")
         alloc_pct = (s["current"] / total_current * 100) if total_current else 0.0
-        fund_rows.append([
-            td(code, bold=True),
-            td(s["name"]),
-            daily_cell,
-            m_cell,
-            m3_cell,
-            tdr(f"{s['shares']:,}"),
-            tdr(f"{alloc_pct:.1f}%"),
-            tdr(f"{s['cost']:,.0f}"),
-            tdr(f"{s['current']:,.0f}"),
-            pnl_para(f"{pnl:+,.0f}", pnl),
-            pnl_para(f"{pct:+.2f}%", pnl),
-        ])
+        if _pdf_bench:
+            b_cur = _pdf_bench.get(code, 0.0)
+            vs_b = s["current"] - b_cur if b_cur else None
+            vs_b_pct = (vs_b / b_cur * 100) if b_cur else None
+            fund_rows.append([
+                td(code, bold=True),
+                td(s["name"]),
+                daily_cell,
+                m_cell,
+                m3_cell,
+                tdr(f"{s['shares']:,}"),
+                tdr(f"{s['cost']:,.0f}"),
+                tdr(f"{s['current']:,.0f}"),
+                pnl_para(f"{pnl:+,.0f}", pnl),
+                pnl_para(f"{pct:+.2f}%", pnl),
+                tdr(f"{b_cur:,.0f}") if b_cur else td("?"),
+                pnl_para(f"{vs_b:+,.0f}", vs_b) if vs_b is not None else td("?"),
+                pnl_para(f"{vs_b_pct:+.2f}%", vs_b_pct) if vs_b_pct is not None else td("?"),
+            ])
+        else:
+            fund_rows.append([
+                td(code, bold=True),
+                td(s["name"]),
+                daily_cell,
+                m_cell,
+                m3_cell,
+                tdr(f"{s['shares']:,}"),
+                tdr(f"{alloc_pct:.1f}%"),
+                tdr(f"{s['cost']:,.0f}"),
+                tdr(f"{s['current']:,.0f}"),
+                pnl_para(f"{pnl:+,.0f}", pnl),
+                pnl_para(f"{pct:+.2f}%", pnl),
+            ])
     avg_1m_pdf = (_pdf_1m_weighted_pct / _pdf_1m_weight_sum) if _pdf_1m_weight_sum else None
     avg_1m_cell = pnl_para(f"{avg_1m_pdf:+.2f}%", avg_1m_pdf, bold=True) if avg_1m_pdf is not None else td("—", align="RIGHT")
     avg_3m_pdf = (_pdf_3m_weighted_pct / _pdf_3m_weight_sum) if _pdf_3m_weight_sum else None
     avg_3m_cell = pnl_para(f"{avg_3m_pdf:+.2f}%", avg_3m_pdf, bold=True) if avg_3m_pdf is not None else td("—", align="RIGHT")
     fund_count = len(fund_summary)
-    fund_rows.append([
-        td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), tdr("100.0%", bold=True),
-        tdr(f"{total_cost:,.0f}", bold=True),
-        tdr(f"{total_current:,.0f}", bold=True),
-        pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
-        pnl_para(f"{total_pnl_pct:+.2f}%", total_pnl, bold=True),
-    ])
-    fund_table = Table(fund_rows, colWidths=[1.3*cm, 5.5*cm, 1.7*cm, 1.7*cm, 1.7*cm, 1.8*cm, 1.6*cm, 2.8*cm, 2.8*cm, 2.6*cm, 1.7*cm])
+    if _pdf_bench:
+        bench_vs = total_current - total_bench_current
+        bench_vs_pct = (bench_vs / total_bench_current * 100) if total_bench_current else 0.0
+        fund_rows.append([
+            td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""),
+            tdr(f"{total_cost:,.0f}", bold=True),
+            tdr(f"{total_current:,.0f}", bold=True),
+            pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
+            pnl_para(f"{total_pnl_pct:+.2f}%", total_pnl, bold=True),
+            tdr(f"{total_bench_current:,.0f}", bold=True),
+            pnl_para(f"{bench_vs:+,.0f}", bench_vs, bold=True),
+            pnl_para(f"{bench_vs_pct:+.2f}%", bench_vs, bold=True),
+        ])
+        fund_table = Table(fund_rows, colWidths=[1.2*cm, 3.7*cm, 1.5*cm, 1.5*cm, 1.5*cm, 1.5*cm, 2.3*cm, 2.3*cm, 2.1*cm, 1.7*cm, 2.3*cm, 2.1*cm, 1.5*cm])
+    else:
+        fund_rows.append([
+            td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), tdr("100.0%", bold=True),
+            tdr(f"{total_cost:,.0f}", bold=True),
+            tdr(f"{total_current:,.0f}", bold=True),
+            pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
+            pnl_para(f"{total_pnl_pct:+.2f}%", total_pnl, bold=True),
+        ])
+        fund_table = Table(fund_rows, colWidths=[1.3*cm, 5.5*cm, 1.7*cm, 1.7*cm, 1.7*cm, 1.8*cm, 1.6*cm, 2.8*cm, 2.8*cm, 2.6*cm, 1.7*cm])
     bg_colors = []
     for i in range(1, len(fund_rows)-1):
         bg = colors.white if i % 2 == 1 else ALT_BG
@@ -688,6 +923,70 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ("ALIGN",        (2,0), (-1,-1), "RIGHT"),
     ] + bg_colors))
     story.append(fund_table)
+    story.append(Spacer(1, 0.6*cm))
+
+    # ── Top/Bottom Performers tables ───────────────────────────────────────────
+    rankings = build_fund_rankings(fund_summary, fund_data, top_n=5)
+
+    def make_side_by_side_table(rows_list):
+        header = [
+            th(rows_list[0][0]), th("Fund"), th("Return"), th("Cur. Value"),
+            th(rows_list[1][0]), th("Fund"), th("Return"), th("Cur. Value"),
+            th(rows_list[2][0]), th("Fund"), th("Return"), th("Cur. Value"),
+        ]
+        rows = [header]
+        max_rows = 5
+        for idx in range(max_rows):
+            row_cells = []
+            for _, term_rows in rows_list:
+                if idx < len(term_rows):
+                    r = term_rows[idx]
+                    row_cells.extend([
+                        td(r["code"], bold=True),
+                        td(r["name"][:28]),
+                        pnl_para(f"{r['ret_pct']:+.2f}%", r['ret_pct']),
+                        tdr(f"{r['current']:,.0f}"),
+                    ])
+                else:
+                    row_cells.extend([td(""), td(""), td(""), td("")])
+            rows.append(row_cells)
+
+        tbl = Table(rows, colWidths=[1.2*cm, 3.8*cm, 1.8*cm, 1.8*cm,
+                                     1.2*cm, 3.8*cm, 1.8*cm, 1.8*cm,
+                                     1.2*cm, 3.8*cm, 1.8*cm, 1.8*cm], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), HEADER_BG),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("BOX", (0,0), (-1,-1), 0.4, colors.black),
+            ("INNERGRID", (0,0), (-1,-1), 0.3, colors.black),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("ALIGN", (2,0), (-1,-1), "RIGHT"),
+            ("ALIGN", (6,0), (6,-1), "RIGHT"),
+            ("ALIGN", (10,0), (10,-1), "RIGHT"),
+            ("LINEAFTER", (3,0), (3,-1), 1, colors.black),
+            ("LINEAFTER", (7,0), (7,-1), 1, colors.black),
+        ]))
+        return tbl
+
+    story.append(Paragraph("Top 5 Performers", heading_style))
+    story.append(Spacer(1, 0.2*cm))
+    story.append(make_side_by_side_table([
+        ("1M", rankings["1M"]["top"]),
+        ("3M", rankings["3M"]["top"]),
+        ("6M", rankings["6M"]["top"]),
+    ]))
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Table([[td("")]], colWidths=[25.5*cm], style=TableStyle([
+        ("LINEBELOW", (0,0), (-1,-1), 1, colors.black),
+    ])))
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph("Bottom 5 Performers", heading_style))
+    story.append(Spacer(1, 0.2*cm))
+    story.append(make_side_by_side_table([
+        ("1M", rankings["1M"]["bottom"]),
+        ("3M", rankings["3M"]["bottom"]),
+        ("6M", rankings["6M"]["bottom"]),
+    ]))
     story.append(Spacer(1, 0.6*cm))
 
     # ── History chart ──────────────────────────────────────────────────────────
@@ -777,10 +1076,10 @@ def write_pdf_report(holdings, fund_data, fund_summary,
 
     doc.build(story)
     print(f"PDF report generated: {filename}")
-    send_email(filename, today_str, total_cost, total_current, total_pnl, total_pnl_pct)
+    send_email(filename, today_str, total_cost, total_current, total_pnl, total_pnl_pct, today_capital)
 
 
-def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_pnl_pct):
+def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_pnl_pct, today_capital=0.0):
     import os
     import smtplib
     from email.message import EmailMessage
@@ -805,7 +1104,7 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
     day_change_str = ""
     if prev_entries:
         prev = prev_entries[-1]
-        new_capital = total_cost - prev["cost"]
+        new_capital = today_capital
         day_delta = (total_current - prev["current"]) - new_capital
         day_pct = (day_delta / prev["current"]) * 100 if prev["current"] else 0
         arrow = "\u2191" if day_delta >= 0 else "\u2193"
