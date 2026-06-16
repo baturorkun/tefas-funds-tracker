@@ -768,7 +768,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         new_capital = today_capital
         today_gain = (today_entry["current"] - prev["current"]) - new_capital
         today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
-        today_daily_str = f"{today_daily_pct:+.2f}%  (vs {prev['date']})"
+        today_daily_str = f"{today_gain:+,.0f} TL  ({today_daily_pct:+.2f}%)  (vs {prev['date']})"
         summary_data.append([td("Today's Daily Return"), pnl_para(today_daily_str, today_daily_pct, bold=True)])
         if new_capital > 0.01:
             summary_data.append([td("  ↳ New Capital Today"), tdr(f"+{new_capital:,.0f} TL")])
@@ -777,7 +777,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             yest_new_capital = prev["cost"] - prev2["cost"]
             yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
             yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
-            yest_daily_str = f"{yest_daily_pct:+.2f}%  (vs {prev2['date']})"
+            yest_daily_str = f"{yest_gain:+,.0f} TL  ({yest_daily_pct:+.2f}%)  (vs {prev2['date']})"
             summary_data.append([td("Yesterday's Return"), pnl_para(yest_daily_str, yest_daily_pct)])
             if yest_new_capital > 0.01:
                 summary_data.append([td("  ↳ New Capital Yesterday"), tdr(f"+{yest_new_capital:,.0f} TL")])
@@ -860,7 +860,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                 tdr(f"{s['cost']:,.0f}"),
                 tdr(f"{s['current']:,.0f}"),
                 pnl_para(f"{pnl:+,.0f}", pnl),
-                pnl_para(f"{pct:+.2f}%", pnl),
+                pnl_para(f"{pct:+.2f}%", pnl, bold=True),
                 tdr(f"{b_cur:,.0f}") if b_cur else td("?"),
                 pnl_para(f"{vs_b:+,.0f}", vs_b) if vs_b is not None else td("?"),
                 pnl_para(f"{vs_b_pct:+.2f}%", vs_b_pct) if vs_b_pct is not None else td("?"),
@@ -877,7 +877,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                 tdr(f"{s['cost']:,.0f}"),
                 tdr(f"{s['current']:,.0f}"),
                 pnl_para(f"{pnl:+,.0f}", pnl),
-                pnl_para(f"{pct:+.2f}%", pnl),
+                pnl_para(f"{pct:+.2f}%", pnl, bold=True),
             ])
     avg_1m_pdf = (_pdf_1m_weighted_pct / _pdf_1m_weight_sum) if _pdf_1m_weight_sum else None
     avg_1m_cell = pnl_para(f"{avg_1m_pdf:+.2f}%", avg_1m_pdf, bold=True) if avg_1m_pdf is not None else td("—", align="RIGHT")
