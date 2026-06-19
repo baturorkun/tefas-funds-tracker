@@ -19,7 +19,12 @@ HEADERS = {
 }
 
 
-def read_portfolio(filename="fon.dat"):
+def read_portfolio(filename="fon.dat", as_of=None):
+    """
+    as_of: YYYY-MM-DD string. Holdings with sold_date < as_of are excluded
+    (sold at end of sold_date, so they appear on sold_date but not after).
+    If as_of is None, all unsold holdings are returned.
+    """
     holdings = []
     with open(filename, "r", encoding="utf-8") as f:
         f.readline()  # skip header
@@ -29,15 +34,16 @@ def read_portfolio(filename="fon.dat"):
                 continue
             parts = line.split()
             if len(parts) >= 3:
-                action = parts[4].strip() if len(parts) > 4 else ""
-                if action.lower() == "delete":
-                    continue
+                sold_date = parts[4].strip() if len(parts) > 4 else ""
+                if sold_date:
+                    if as_of is None or sold_date < as_of:
+                        continue
                 holdings.append({
                     "alim_tarihi": parts[0].strip(),
                     "fon_kodu": parts[1].strip(),
                     "pay_adeti": int(parts[2].strip()),
                     "banka": parts[3].strip() if len(parts) > 3 else "",
-                    "action": action,
+                    "sold_date": sold_date,
                 })
     return holdings
 
@@ -307,19 +313,27 @@ def generate_history_chart(history, days=30):
 
     labels   = [e["date"][5:] for e in recent]   # MM-DD
     xs       = list(range(len(recent)))
-    currents = [e["current"] / 1000 for e in recent]
 
     # Daily return bars should be cash-flow-adjusted (so red/green days are visible)
     daily_series = compute_daily_return_series(recent)
     daily_by_date = {d["date"]: d for d in daily_series}
     daily_pcts = [daily_by_date.get(e["date"], {"daily_pct": 0.0})["daily_pct"] for e in recent]
 
+    # Build cash-flow-adjusted portfolio value line: start at first day's value,
+    # then add only organic daily_gain (excluding new capital injections)
+    adj_val = recent[0]["current"]
+    adj_values = [adj_val]
+    for d in daily_series:
+        adj_val += d["daily_gain"]
+        adj_values.append(adj_val)
+    adj_currents = [v / 1000 for v in adj_values]
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 4.5), sharex=True,
                                     gridspec_kw={"height_ratios": [2, 1]})
     fig.patch.set_facecolor("white")
 
-    ax1.plot(xs, currents, color="#1f4e79", linewidth=1.8, zorder=3)
-    ax1.fill_between(xs, currents, min(currents) * 0.998, alpha=0.12, color="#1f4e79")
+    ax1.plot(xs, adj_currents, color="#1f4e79", linewidth=1.8, zorder=3)
+    ax1.fill_between(xs, adj_currents, min(adj_currents) * 0.998, alpha=0.12, color="#1f4e79")
     ax1.set_ylabel("Portfolio Value (TL x1000)")
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:,.0f}K"))
     ax1.grid(True, alpha=0.3, linestyle="--")
@@ -355,7 +369,6 @@ def main():
     parser.add_argument("--date", help="Run for a specific date (YYYY-MM-DD) instead of today")
     args = parser.parse_args()
 
-    holdings = read_portfolio("fon.dat")
     if args.date:
         try:
             today = datetime.strptime(args.date, "%Y-%m-%d")
@@ -365,6 +378,8 @@ def main():
     else:
         today = datetime.now()
     today_str = today.strftime("%Y-%m-%d")
+
+    holdings = read_portfolio("fon.dat", as_of=today_str)
 
     if today.weekday() >= 5 and not args.force:  # 5=Saturday, 6=Sunday
         day_name = "Saturday" if today.weekday() == 5 else "Sunday"
@@ -389,15 +404,26 @@ def main():
     # Fetch prices
     print("Fetching fund prices...\n")
     fund_data = {}  # code -> (prices_dict, fund_name)
+    price_errors = []
     for code in fund_codes:
         print(f"  [{code}] ", end="", flush=True)
         prices, name = get_fund_prices(code)
         fund_data[code] = (prices, name)
         if prices:
             latest_date = max(prices.keys())
-            print(f"{name[:50]:<52} — {len(prices)} days, latest: {latest_date} = {prices[latest_date]:.6f}")
+            latest_price = prices[latest_date]
+            print(f"{name[:50]:<52} — {len(prices)} days, latest: {latest_date} = {latest_price:.6f}")
+            if latest_price == 0:
+                price_errors.append(f"[{code}] {name[:50]} — latest price is 0 on {latest_date}")
         else:
             print("NO DATA")
+            price_errors.append(f"[{code}] — no price data returned")
+
+    if price_errors:
+        print("\n⛔ Aborting: uncertain prices detected — report not generated.")
+        for err in price_errors:
+            print(f"  ✗ {err}")
+        return
 
     # ── Benchmark fund ─────────────────────────────────────────────────────────
     benchmark_code = os.environ.get("BENCHMARK_FUND", "").strip().upper()
@@ -438,7 +464,7 @@ def main():
     bench_rows = []
 
     # For per-fund summary
-    fund_summary = defaultdict(lambda: {"cost": 0.0, "current": 0.0, "shares": 0, "name": ""})
+    fund_summary = defaultdict(lambda: {"cost": 0.0, "current": 0.0, "shares": 0, "name": "", "weighted_days": 0.0, "buy_count": 0})
 
     for h in holdings:
         code = h["fon_kodu"]
@@ -477,6 +503,12 @@ def main():
             fund_summary[code]["current"] += current_val
             fund_summary[code]["shares"] += shares
             fund_summary[code]["name"] = fund_name
+            try:
+                _days_held = (datetime.strptime(today_str, "%Y-%m-%d") - datetime.strptime(buy_date, "%Y-%m-%d")).days
+            except ValueError:
+                _days_held = 0
+            fund_summary[code]["weighted_days"] += cost * _days_held
+            fund_summary[code]["buy_count"] += 1
 
             note = f" *{used_buy_date}" if used_buy_date != buy_date else ""
             print(col.format(
@@ -620,7 +652,7 @@ def main():
     history = [e for e in existing if e["date"] < today_str]  # exclude today
     if history:
         prev = history[-1]
-        new_capital = today_capital
+        new_capital = total_cost - prev["cost"]
         today_gain = (total_current - prev["current"]) - new_capital
         today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
         print(f"\n  Today's Daily Return: {today_daily_pct:>+7.2f}%  ({prev['date']} \u2192 {today_str})")
@@ -765,7 +797,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         summary_data.append([td("  ↳ vs Benchmark"), pnl_para(vs_bench_str, vs_bench)])
     if today_entry and prev_entries:
         prev = prev_entries[-1]
-        new_capital = today_capital
+        new_capital = today_entry["cost"] - prev["cost"]
         today_gain = (today_entry["current"] - prev["current"]) - new_capital
         today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
         today_daily_str = f"{today_gain:+,.0f} TL  ({today_daily_pct:+.2f}%)  (vs {prev['date']})"
@@ -800,11 +832,11 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     story.append(Spacer(1, 0.2*cm))
     _pdf_bench = fund_bench if fund_bench else {}
     if _pdf_bench:
-        fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Shares"),
+        fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Days"), th("Shares"),
                        th("Buy Value"), th("Cur. Value"), th("P&L"), th("P&L %"),
                        th("Bench Val"), th("vs Bench"), th("vs Bnch%")]
     else:
-        fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Shares"), th("Portfolio %"),
+        fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Days"), th("Shares"), th("Portfolio %"),
                        th("Buy Value"), th("Cur. Value"),
                        th("P&L"), th("P&L %")]
     fund_rows = [fund_header]
@@ -856,6 +888,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                 daily_cell,
                 m_cell,
                 m3_cell,
+                tdr(f"{int(s['weighted_days']/s['cost'])}{'*' if s['buy_count'] > 1 else ''}") if s["cost"] else td("—", align="RIGHT"),
                 tdr(f"{s['shares']:,}"),
                 tdr(f"{s['cost']:,.0f}"),
                 tdr(f"{s['current']:,.0f}"),
@@ -872,6 +905,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                 daily_cell,
                 m_cell,
                 m3_cell,
+                tdr(f"{int(s['weighted_days']/s['cost'])}{'*' if s['buy_count'] > 1 else ''}") if s["cost"] else td("—", align="RIGHT"),
                 tdr(f"{s['shares']:,}"),
                 tdr(f"{alloc_pct:.1f}%"),
                 tdr(f"{s['cost']:,.0f}"),
@@ -888,7 +922,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         bench_vs = total_current - total_bench_current
         bench_vs_pct = (bench_vs / total_bench_current * 100) if total_bench_current else 0.0
         fund_rows.append([
-            td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""),
+            td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), td(""),
             tdr(f"{total_cost:,.0f}", bold=True),
             tdr(f"{total_current:,.0f}", bold=True),
             pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
@@ -897,16 +931,16 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             pnl_para(f"{bench_vs:+,.0f}", bench_vs, bold=True),
             pnl_para(f"{bench_vs_pct:+.2f}%", bench_vs, bold=True),
         ])
-        fund_table = Table(fund_rows, colWidths=[1.2*cm, 3.7*cm, 1.5*cm, 1.5*cm, 1.5*cm, 1.5*cm, 2.3*cm, 2.3*cm, 2.1*cm, 1.7*cm, 2.3*cm, 2.1*cm, 1.5*cm])
+        fund_table = Table(fund_rows, colWidths=[1.2*cm, 3.7*cm, 1.5*cm, 1.5*cm, 1.5*cm, 1.2*cm, 1.5*cm, 2.3*cm, 2.3*cm, 2.1*cm, 1.7*cm, 2.3*cm, 2.1*cm, 1.5*cm])
     else:
         fund_rows.append([
-            td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), tdr("100.0%", bold=True),
+            td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), td(""), tdr("100.0%", bold=True),
             tdr(f"{total_cost:,.0f}", bold=True),
             tdr(f"{total_current:,.0f}", bold=True),
             pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
             pnl_para(f"{total_pnl_pct:+.2f}%", total_pnl, bold=True),
         ])
-        fund_table = Table(fund_rows, colWidths=[1.3*cm, 5.5*cm, 1.7*cm, 1.7*cm, 1.7*cm, 1.8*cm, 1.6*cm, 2.8*cm, 2.8*cm, 2.6*cm, 1.7*cm])
+        fund_table = Table(fund_rows, colWidths=[1.3*cm, 5.5*cm, 1.7*cm, 1.7*cm, 1.7*cm, 1.2*cm, 1.8*cm, 1.6*cm, 2.8*cm, 2.8*cm, 2.6*cm, 1.7*cm])
     bg_colors = []
     for i in range(1, len(fund_rows)-1):
         bg = colors.white if i % 2 == 1 else ALT_BG
@@ -1004,7 +1038,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     tx_header = [th("Bank"), th("Fund"), th("Buy Date"), th("Shares"),
                  th("Buy Price"), th("Today Price"),
                  th("Buy Value (TL)"), th("Cur. Value (TL)"),
-                 th("P&L (TL)"), th("P&L %"), th("Note")]
+                 th("P&L (TL)"), th("P&L %"), th("Sold")]
     tx_rows = [tx_header]
     for h in holdings:
         code = h["fon_kodu"]
@@ -1023,8 +1057,8 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             note_parts = []
             if used_buy_date != expected:
                 note_parts.append(f"*{used_buy_date}")
-            if h.get("action"):
-                note_parts.append(h["action"])
+            if h.get("sold_date"):
+                note_parts.append(h["sold_date"])
             note = "  ".join(note_parts)
             tx_rows.append([
                 td(bank), td(code, bold=True), td(buy_date),
@@ -1104,7 +1138,7 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
     day_change_str = ""
     if prev_entries:
         prev = prev_entries[-1]
-        new_capital = today_capital
+        new_capital = total_cost - prev["cost"]
         day_delta = (total_current - prev["current"]) - new_capital
         day_pct = (day_delta / prev["current"]) * 100 if prev["current"] else 0
         arrow = "\u2191" if day_delta >= 0 else "\u2193"
