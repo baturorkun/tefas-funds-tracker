@@ -18,6 +18,7 @@ A daily portfolio profit/loss reporter for Turkish mutual funds. Fetches live fu
   - 30-day portfolio performance chart
 - Sends the PDF via email (SMTP)
 - Persists daily history in `reports/history.tsv`
+- Persists TEFAS fund-level stats in `reports/fund_stats.tsv`
 - Docker + Ofelia scheduler for fully automated daily runs (weekdays at 11:00)
 
 ## Setup
@@ -88,6 +89,13 @@ Reports are saved to the `reports/` directory:
 reports/
   rapor_2026-05-08.pdf
   history.tsv
+  fund_stats.tsv
+```
+
+`fund_stats.tsv` columns are:
+
+```
+date    fund_code    participant_count    fund_size_tl    outstanding_shares    market_share_pct
 ```
 
 ## Requirements

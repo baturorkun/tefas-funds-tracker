@@ -12,6 +12,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 TEFAS_URL = "https://www.tefas.gov.tr/api/funds/fonFiyatBilgiGetir"
+TEFAS_INFO_URL = "https://www.tefas.gov.tr/api/funds/fonBilgiGetir"
 HEADERS = {
     "Content-Type": "application/json",
     "Referer": "https://www.tefas.gov.tr/",
@@ -35,11 +36,14 @@ def read_portfolio(filename="fon.dat", as_of=None):
             parts = line.split()
             if len(parts) >= 3:
                 sold_date = parts[4].strip() if len(parts) > 4 else ""
+                buy_date = parts[0].strip()
+                if as_of is not None and buy_date > as_of:
+                    continue
                 if sold_date:
                     if as_of is None or sold_date < as_of:
                         continue
                 holdings.append({
-                    "alim_tarihi": parts[0].strip(),
+                    "alim_tarihi": buy_date,
                     "fon_kodu": parts[1].strip(),
                     "pay_adeti": int(parts[2].strip()),
                     "banka": parts[3].strip() if len(parts) > 3 else "",
@@ -68,6 +72,30 @@ def get_fund_prices(fund_code, periyod=12):
     except Exception as e:
         print(f"  Error ({fund_code}): {e}")
         return {}, fund_code
+
+
+def get_fund_stats(fund_code):
+    """Returns current TEFAS fund-level stats for a fund code."""
+    payload = {"fonKodu": fund_code, "dil": "TR"}
+    try:
+        resp = requests.post(TEFAS_INFO_URL, json=payload, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        result_list = data.get("resultList") or []
+        if not result_list:
+            return None
+        item = result_list[0]
+        return {
+            "code": item.get("fonKodu", fund_code),
+            "name": item.get("fonUnvan", fund_code),
+            "participant_count": int(item.get("yatirimciSayi") or 0),
+            "fund_size": float(item.get("portBuyukluk") or 0.0),
+            "outstanding_shares": int(item.get("payAdet") or 0),
+            "market_share_pct": float(item.get("pazarPayi") or 0.0),
+        }
+    except Exception as e:
+        print(f"  Stats error ({fund_code}): {e}")
+        return None
 
 
 def find_closest_price(prices, target_date_str):
@@ -196,6 +224,37 @@ def print_fund_performance_rankings(fund_summary, fund_data, top_n=5):
     Prints console tables with top/bottom performers for 1M, 3M and 6M returns.
     """
     rankings = build_fund_rankings(fund_summary, fund_data, top_n=top_n)
+
+    # ── Personal P&L rankings (since buy) ─────────────────────────────────────
+    personal = []
+    for code, s in fund_summary.items():
+        cost = s.get("cost", 0.0)
+        current = s.get("current", 0.0)
+        if cost <= 0:
+            continue
+        pnl_pct = (current - cost) / cost * 100
+        personal.append({
+            "code": code, "name": s.get("name", code),
+            "ret_pct": pnl_pct, "pnl": current - cost, "current": current,
+        })
+    personal_sorted = sorted(personal, key=lambda x: x["ret_pct"], reverse=True)
+    row2 = "{:<6} {:<48} {:>10} {:>14} {:>14}"
+    print("\n" + "=" * 115)
+    print("MY TOP 5 (since buy — personal P&L %)")
+    print(row2.format("Fund", "Fund Name", "P&L %", "P&L (TL)", "Cur. Value"))
+    print("-" * 105)
+    for r in personal_sorted[:top_n]:
+        print(row2.format(r["code"], r["name"][:48],
+                          f"{r['ret_pct']:+.2f}%", f"{r['pnl']:+,.0f}", f"{r['current']:,.0f}"))
+    print("\n" + "=" * 115)
+    print("MY BOTTOM 5 (since buy — personal P&L %)")
+    print(row2.format("Fund", "Fund Name", "P&L %", "P&L (TL)", "Cur. Value"))
+    print("-" * 105)
+    for r in personal_sorted[-top_n:][::-1]:
+        print(row2.format(r["code"], r["name"][:48],
+                          f"{r['ret_pct']:+.2f}%", f"{r['pnl']:+,.0f}", f"{r['current']:,.0f}"))
+    print("=" * 115)
+
     row = "{:<6} {:<48} {:>10} {:>14}"
 
     print("\n" + "=" * 115)
@@ -270,6 +329,85 @@ def read_history():
     return entries
 
 
+def read_fund_stats_history():
+    import os
+    path = os.path.join("reports", "fund_stats.tsv")
+    if not os.path.exists(path):
+        return []
+    entries = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 6:
+                continue
+            try:
+                entries.append({
+                    "date": parts[0],
+                    "code": parts[1],
+                    "participant_count": int(float(parts[2])),
+                    "fund_size": float(parts[3]),
+                    "outstanding_shares": int(float(parts[4])),
+                    "market_share_pct": float(parts[5]),
+                })
+            except ValueError:
+                continue
+    entries.sort(key=lambda x: (x["date"], x["code"]))
+    return entries
+
+
+def save_fund_stats(rows):
+    import os
+    path = os.path.join("reports", "fund_stats.tsv")
+    os.makedirs("reports", exist_ok=True)
+    existing = read_fund_stats_history()
+    replace_keys = {(r["date"], r["code"]) for r in rows}
+    kept = [r for r in existing if (r["date"], r["code"]) not in replace_keys]
+    all_rows = kept + rows
+    all_rows.sort(key=lambda x: (x["date"], x["code"]))
+    with open(path, "w", encoding="utf-8") as f:
+        for r in all_rows:
+            f.write(
+                f"{r['date']}\t{r['code']}\t{r['participant_count']}\t"
+                f"{r['fund_size']:.2f}\t{r['outstanding_shares']}\t"
+                f"{r['market_share_pct']:g}\n"
+            )
+
+
+def print_fund_stats_changes(rows, previous_entries):
+    if not rows:
+        return
+
+    previous_by_code = {}
+    for r in rows:
+        candidates = [
+            e for e in previous_entries
+            if e["code"] == r["code"] and e["date"] < r["date"]
+        ]
+        if candidates:
+            previous_by_code[(r["date"], r["code"])] = sorted(candidates, key=lambda x: x["date"])[-1]
+
+    print("\n" + "=" * 115)
+    print("FUND STATS")
+    col = "{:<6} {:>12} {:>12} {:>16} {:>14} {:>12} {:>10}"
+    print(col.format("Fund", "Investors", "Inv. Δ", "Fund Size", "Size Δ", "Mkt Share", "Mkt Δ"))
+    print("-" * 95)
+    for r in sorted(rows, key=lambda x: x["code"]):
+        prev = previous_by_code.get((r["date"], r["code"]))
+        investor_delta = r["participant_count"] - prev["participant_count"] if prev else None
+        size_delta = r["fund_size"] - prev["fund_size"] if prev else None
+        market_delta = r["market_share_pct"] - prev["market_share_pct"] if prev else None
+        print(col.format(
+            r["code"],
+            f"{r['participant_count']:,}",
+            f"{investor_delta:+,}" if investor_delta is not None else "?",
+            f"{r['fund_size']:,.0f}",
+            f"{size_delta:+,.0f}" if size_delta is not None else "?",
+            f"{r['market_share_pct']:.2f}%",
+            f"{market_delta:+.2f}" if market_delta is not None else "?",
+        ))
+    print("=" * 115)
+
+
 def compute_daily_return_series(entries):
     """
     Compute cash-flow-adjusted daily returns from history-like entries.
@@ -306,10 +444,7 @@ def generate_history_chart(history, days=30):
     if len(history) < 2:
         return None
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    recent = [e for e in history if e["date"] >= cutoff]
-    if len(recent) < 2:
-        recent = history
+    recent = history[-days:] if len(history) > days else history
 
     labels   = [e["date"][5:] for e in recent]   # MM-DD
     xs       = list(range(len(recent)))
@@ -424,6 +559,39 @@ def main():
         for err in price_errors:
             print(f"  ✗ {err}")
         return
+
+    latest_data_dates = [
+        max(prices.keys()) for prices, _ in fund_data.values()
+        if prices
+    ]
+    latest_data_date = max(latest_data_dates) if latest_data_dates else today_str
+    if not args.date or today_str == latest_data_date:
+        print("\nFetching fund stats...\n")
+        previous_fund_stats = read_fund_stats_history()
+        fund_stats_rows = []
+        for code in fund_codes:
+            print(f"  [{code}] stats ", end="", flush=True)
+            stats = get_fund_stats(code)
+            if not stats:
+                print("NO DATA")
+                continue
+            prices, _ = fund_data.get(code, ({}, code))
+            stats["date"] = max(prices.keys()) if prices else latest_data_date
+            fund_stats_rows.append(stats)
+            print(
+                f"investors: {stats['participant_count']:,}, "
+                f"size: {stats['fund_size']:,.0f} TL, "
+                f"market share: {stats['market_share_pct']:.2f}%"
+            )
+        if fund_stats_rows:
+            save_fund_stats(fund_stats_rows)
+            print_fund_stats_changes(fund_stats_rows, previous_fund_stats)
+            print("Fund stats saved: reports/fund_stats.tsv")
+    else:
+        print(
+            f"\nSkipping fund stats for historical report date {today_str}; "
+            f"TEFAS latest stats date appears to be {latest_data_date}."
+        )
 
     # ── Benchmark fund ─────────────────────────────────────────────────────────
     benchmark_code = os.environ.get("BENCHMARK_FUND", "").strip().upper()
@@ -802,8 +970,8 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
         today_daily_str = f"{today_gain:+,.0f} TL  ({today_daily_pct:+.2f}%)  (vs {prev['date']})"
         summary_data.append([td("Today's Daily Return"), pnl_para(today_daily_str, today_daily_pct, bold=True)])
-        if new_capital > 0.01:
-            summary_data.append([td("  ↳ New Capital Today"), tdr(f"+{new_capital:,.0f} TL")])
+        if abs(new_capital) > 0.01:
+            summary_data.append([td("  ↳ Net Capital Change"), tdr(f"{new_capital:+,.0f} TL")])
         if len(prev_entries) >= 2:
             prev2 = prev_entries[-2]
             yest_new_capital = prev["cost"] - prev2["cost"]
@@ -811,8 +979,8 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
             yest_daily_str = f"{yest_gain:+,.0f} TL  ({yest_daily_pct:+.2f}%)  (vs {prev2['date']})"
             summary_data.append([td("Yesterday's Return"), pnl_para(yest_daily_str, yest_daily_pct)])
-            if yest_new_capital > 0.01:
-                summary_data.append([td("  ↳ New Capital Yesterday"), tdr(f"+{yest_new_capital:,.0f} TL")])
+            if abs(yest_new_capital) > 0.01:
+                summary_data.append([td("  ↳ Net Capital Change"), tdr(f"{yest_new_capital:+,.0f} TL")])
     summary_table = Table(summary_data, colWidths=[5*cm, 7*cm])
     summary_table.setStyle(TableStyle([
         ("BACKGROUND",  (0,0), (-1,0), HEADER_BG),
@@ -1002,6 +1170,63 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ]))
         return tbl
 
+    # ── Personal P&L top/bottom table ─────────────────────────────────────────
+    personal = []
+    for code, s in fund_summary.items():
+        cost = s.get("cost", 0.0)
+        current = s.get("current", 0.0)
+        if cost <= 0:
+            continue
+        pnl_pct = (current - cost) / cost * 100
+        personal.append({"code": code, "name": s.get("name", code),
+                         "ret_pct": pnl_pct, "pnl": current - cost, "current": current})
+    personal_sorted = sorted(personal, key=lambda x: x["ret_pct"], reverse=True)
+    top5_personal    = personal_sorted[:5]
+    bottom5_personal = personal_sorted[-5:][::-1]
+
+    def make_personal_table(top_rows, bottom_rows):
+        header = [
+            th("My Top"), th("Fund"), th("P&L %"), th("P&L (TL)"), th("Cur. Value"),
+            th("My Bottom"), th("Fund"), th("P&L %"), th("P&L (TL)"), th("Cur. Value"),
+        ]
+        rows = [header]
+        for idx in range(max(len(top_rows), len(bottom_rows))):
+            row_cells = []
+            for side in (top_rows, bottom_rows):
+                if idx < len(side):
+                    r = side[idx]
+                    row_cells.extend([
+                        td(r["code"], bold=True),
+                        td(r["name"][:28]),
+                        pnl_para(f"{r['ret_pct']:+.2f}%", r["ret_pct"]),
+                        pnl_para(f"{r['pnl']:+,.0f}", r["pnl"]),
+                        tdr(f"{r['current']:,.0f}"),
+                    ])
+                else:
+                    row_cells.extend([td(""), td(""), td(""), td(""), td("")])
+            rows.append(row_cells)
+        tbl = Table(rows, colWidths=[1.2*cm, 3.8*cm, 1.8*cm, 2.2*cm, 2.0*cm,
+                                     1.2*cm, 3.8*cm, 1.8*cm, 2.2*cm, 2.0*cm], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), HEADER_BG),
+            ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
+            ("BOX",        (0,0), (-1,-1), 0.4, colors.black),
+            ("INNERGRID",  (0,0), (-1,-1), 0.3, colors.black),
+            ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+            ("ALIGN",      (2,0), (-1,-1), "RIGHT"),
+            ("LINEAFTER",  (4,0), (4,-1), 1, colors.black),
+        ]))
+        return tbl
+
+    story.append(Paragraph("My Best / Worst (since buy — personal P&L %)", heading_style))
+    story.append(Spacer(1, 0.2*cm))
+    story.append(make_personal_table(top5_personal, bottom5_personal))
+    story.append(Spacer(1, 0.5*cm))
+    story.append(Table([[td("")]], colWidths=[25.5*cm], style=TableStyle([
+        ("LINEBELOW", (0,0), (-1,-1), 1, colors.black),
+    ])))
+    story.append(Spacer(1, 0.4*cm))
+
     story.append(Paragraph("Top 5 Performers", heading_style))
     story.append(Spacer(1, 0.2*cm))
     story.append(make_side_by_side_table([
@@ -1021,7 +1246,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ("3M", rankings["3M"]["bottom"]),
         ("6M", rankings["6M"]["bottom"]),
     ]))
-    story.append(Spacer(1, 0.6*cm))
+    story.append(Spacer(1, 0.5*cm))
 
     # ── History chart ──────────────────────────────────────────────────────────
     chart_path = generate_history_chart(history)
