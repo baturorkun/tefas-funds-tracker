@@ -13,6 +13,7 @@ A daily portfolio profit/loss reporter for Turkish mutual funds. Fetches live fu
 - Highlights daily gainers/losers ≥1% in bold green/red
 - Generates a formatted PDF report with:
   - Portfolio summary (total invested, current value, P&L, daily returns)
+  - Bank totals (invested amount, current value, P&L, and portfolio share)
   - Fund summary table with daily return and portfolio weight
   - Transaction detail table
   - 30-day portfolio performance chart

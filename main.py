@@ -1,4 +1,5 @@
 import requests
+import math
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, timedelta
@@ -190,6 +191,99 @@ def fund_6month_return(prices):
     return pct, today_price, price_6m
 
 
+def calculate_xirr(cash_flows):
+    """Calculate annualized money-weighted return for dated cash flows."""
+    if not cash_flows or not any(v < 0 for _, v in cash_flows) or not any(v > 0 for _, v in cash_flows):
+        return None
+
+    dated = [(datetime.strptime(d, "%Y-%m-%d"), v) for d, v in cash_flows]
+    origin = min(d for d, _ in dated)
+    years = [((d - origin).days / 365.0, v) for d, v in dated]
+    if max(t for t, _ in years) <= 0:
+        return None
+
+    # Solve in log(1 + rate) space. This remains stable for very high annualized
+    # returns caused by young positions.
+    def npv(log_rate):
+        return sum(value * math.exp(-log_rate * year) for year, value in years)
+
+    low, high = -50.0, 50.0
+    low_npv, high_npv = npv(low), npv(high)
+    if low_npv * high_npv > 0:
+        return None
+    for _ in range(200):
+        mid = (low + high) / 2
+        mid_npv = npv(mid)
+        if abs(mid_npv) < 0.00000001:
+            break
+        if mid_npv > 0:
+            low = mid
+        else:
+            high = mid
+    try:
+        return math.expm1((low + high) / 2)
+    except OverflowError:
+        return None
+
+
+def calculate_fund_xirrs(holdings, fund_data, as_of):
+    """Return per-fund and whole-portfolio XIRR for currently open positions."""
+    flows_by_fund = defaultdict(list)
+    current_by_fund = defaultdict(float)
+    for holding in holdings:
+        code = holding["fon_kodu"]
+        prices, _ = fund_data.get(code, ({}, code))
+        buy_price, _ = find_closest_price(prices, holding["alim_tarihi"])
+        current_price, _ = find_closest_price(prices, as_of)
+        if buy_price is None or current_price is None:
+            continue
+        shares = holding["pay_adeti"]
+        flows_by_fund[code].append((holding["alim_tarihi"], -(buy_price * shares)))
+        current_by_fund[code] += current_price * shares
+
+    fund_xirr = {}
+    portfolio_flows = []
+    for code, flows in flows_by_fund.items():
+        terminal = (as_of, current_by_fund[code])
+        fund_xirr[code] = calculate_xirr(flows + [terminal])
+        portfolio_flows.extend(flows)
+        portfolio_flows.append(terminal)
+    return fund_xirr, calculate_xirr(portfolio_flows)
+
+
+def calculate_bank_totals(holdings, fund_data, as_of):
+    """Return invested and current portfolio values grouped by bank."""
+    bank_totals = defaultdict(lambda: {"cost": 0.0, "current": 0.0})
+    for holding in holdings:
+        code = holding["fon_kodu"]
+        prices, _ = fund_data.get(code, ({}, code))
+        buy_price, _ = find_closest_price(prices, holding["alim_tarihi"])
+        current_price, _ = find_closest_price(prices, as_of)
+        if buy_price is None or current_price is None:
+            continue
+
+        bank = holding.get("banka", "").strip() or "Unspecified"
+        shares = holding["pay_adeti"]
+        bank_totals[bank]["cost"] += buy_price * shares
+        bank_totals[bank]["current"] += current_price * shares
+
+    return bank_totals
+
+
+def personal_30d_return(xirr):
+    """Convert an annual XIRR rate to its compounded 30-day equivalent."""
+    if xirr is None or xirr <= -1:
+        return None
+    return math.expm1(math.log1p(xirr) * 30 / 365)
+
+
+def format_personal_30d(xirr):
+    rate = personal_30d_return(xirr)
+    if rate is None:
+        return "—"
+    return f"{rate * 100:+.2f}%"
+
+
 def build_fund_rankings(fund_summary, fund_data, top_n=5):
     horizons = [
         ("1M", fund_monthly_return),
@@ -295,7 +389,8 @@ def print_fund_performance_rankings(fund_summary, fund_data, top_n=5):
     print("=" * 115)
 
 
-def save_history(date_str, total_cost, total_current, total_pnl, total_pnl_pct):
+def save_history(date_str, total_cost, total_current, total_pnl, total_pnl_pct,
+                 daily_gain=None, daily_pct=None):
     import os
     path = os.path.join("reports", "history.tsv")
     lines = []
@@ -303,7 +398,12 @@ def save_history(date_str, total_cost, total_current, total_pnl, total_pnl_pct):
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
     lines = [l for l in lines if l.strip() and not l.startswith(date_str)]
-    lines.append(f"{date_str}\t{total_cost:.0f}\t{total_current:.0f}\t{total_pnl:.0f}\t{total_pnl_pct:.2f}\n")
+    daily_gain_str = f"{daily_gain:.2f}" if daily_gain is not None else ""
+    daily_pct_str = f"{daily_pct:.6f}" if daily_pct is not None else ""
+    lines.append(
+        f"{date_str}\t{total_cost:.0f}\t{total_current:.0f}\t"
+        f"{total_pnl:.0f}\t{total_pnl_pct:.2f}\t{daily_gain_str}\t{daily_pct_str}\n"
+    )
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
@@ -318,13 +418,17 @@ def read_history():
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) >= 5:
-                entries.append({
+                entry = {
                     "date": parts[0],
                     "cost": float(parts[1]),
                     "current": float(parts[2]),
                     "pnl": float(parts[3]),
                     "pnl_pct": float(parts[4]),
-                })
+                }
+                if len(parts) >= 7 and parts[5] and parts[6]:
+                    entry["daily_gain"] = float(parts[5])
+                    entry["daily_pct"] = float(parts[6])
+                entries.append(entry)
     entries.sort(key=lambda x: x["date"])
     return entries
 
@@ -408,6 +512,33 @@ def print_fund_stats_changes(rows, previous_entries):
     print("=" * 115)
 
 
+def compute_holding_period_return(holdings, fund_data, start_date, end_date):
+    """Return gain and percentage from positions held at the end of a period.
+
+    Closed positions that disappear after ``start_date`` are intentionally not
+    treated as a loss of capital. New positions use their buy value as the
+    period starting value, so purchases and sales cannot masquerade as return.
+    """
+    start_value = 0.0
+    end_value = 0.0
+    for holding in holdings:
+        prices, _ = fund_data.get(holding["fon_kodu"], ({}, holding["fon_kodu"]))
+        if not prices:
+            continue
+        position_start = max(start_date, holding["alim_tarihi"])
+        start_price, _ = find_closest_price(prices, position_start)
+        end_price, _ = find_closest_price(prices, end_date)
+        if start_price is None or end_price is None:
+            continue
+        shares = holding["pay_adeti"]
+        start_value += start_price * shares
+        end_value += end_price * shares
+
+    gain = end_value - start_value
+    pct = (gain / start_value * 100) if start_value else 0.0
+    return gain, pct
+
+
 def compute_daily_return_series(entries):
     """
     Compute cash-flow-adjusted daily returns from history-like entries.
@@ -424,8 +555,14 @@ def compute_daily_return_series(entries):
         prev = ordered[i - 1]
         cur = ordered[i]
         new_capital = cur["cost"] - prev["cost"]
-        daily_gain = (cur["current"] - prev["current"]) - new_capital
-        daily_pct = (daily_gain / prev["current"] * 100) if prev["current"] else 0.0
+        if "daily_gain" in cur and "daily_pct" in cur:
+            daily_gain = cur["daily_gain"]
+            daily_pct = cur["daily_pct"]
+        else:
+            # Compatibility with history rows written before position-based
+            # daily returns were stored.
+            daily_gain = (cur["current"] - prev["current"]) - new_capital
+            daily_pct = (daily_gain / prev["current"] * 100) if prev["current"] else 0.0
         series.append({
             "date": cur["date"],
             "daily_gain": daily_gain,
@@ -731,23 +868,28 @@ def main():
         for _, _fc, _, _, _bc, _ in bench_rows:
             if _bc is not None:
                 fund_bench[_fc] = fund_bench.get(_fc, 0.0) + _bc
+    fund_xirr, portfolio_xirr = calculate_fund_xirrs(holdings, fund_data, today_str)
     _bench_cols = use_benchmark and bool(fund_bench)
-    sep_w = 171 if _bench_cols else 135
+    sep_w = 187 if _bench_cols else 151
     print("\n" + "=" * sep_w)
     print("FUND SUMMARY\n")
     if _bench_cols:
-        col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>14} {:>10} {:>9} {:>8}"
-        print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "Bench Val", "vs Bench", "vs Bnch%", "P&L %"))
+        col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>14} {:>10} {:>9} {:>8} {:>14}"
+        print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "Bench Val", "vs Bench", "vs Bnch%", "P&L %", "Personal 30D %"))
     else:
-        col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>8}"
-        print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "P&L %"))
+        col2 = "{:<5} {:<50} {:>8} {:>10} {:>10} {:>10} {:>14} {:>14} {:>14} {:>8} {:>14}"
+        print(col2.format("Fund", "Fund Name", "Today %", "1M %", "3M %", "Shares", "Buy Value", "Cur. Value", "P&L", "P&L %", "Personal 30D %"))
     print("-" * sep_w)
     # Collect 1M and 3M data for weighted averages
     _1m_weight_sum = 0.0
     _1m_weighted_pct = 0.0
     _3m_weight_sum = 0.0
     _3m_weighted_pct = 0.0
-    for code in sorted(fund_summary.keys(), key=lambda c: fund_summary[c]["cost"], reverse=True):
+    for code in sorted(
+        fund_summary.keys(),
+        key=lambda c: fund_xirr.get(c) if fund_xirr.get(c) is not None else float("-inf"),
+        reverse=True,
+    ):
         s = fund_summary[code]
         pnl = s["current"] - s["cost"]
         pct = (pnl / s["cost"] * 100) if s["cost"] else 0.0
@@ -785,7 +927,7 @@ def main():
                 f"{b_cur:,.0f}" if b_cur else "?",
                 f"{vs_b:+,.0f}" if vs_b is not None else "?",
                 f"{vs_b_pct:+.2f}%" if vs_b_pct is not None else "?",
-                f"{pct:+.2f}%"
+                f"{pct:+.2f}%", format_personal_30d(fund_xirr.get(code))
             ))
         else:
             print(col2.format(
@@ -793,7 +935,7 @@ def main():
                 daily_pct_str, m_pct_str, m3_pct_str,
                 f"{s['shares']:,}",
                 f"{s['cost']:,.0f}", f"{s['current']:,.0f}",
-                f"{pnl:+,.0f}", f"{pct:+.2f}%"
+                f"{pnl:+,.0f}", f"{pct:+.2f}%", format_personal_30d(fund_xirr.get(code))
             ))
     print("-" * sep_w)
     avg_1m_str = f"{(_1m_weighted_pct / _1m_weight_sum):+.2f}%" if _1m_weight_sum else "—"
@@ -802,9 +944,9 @@ def main():
     if _bench_cols:
         bench_vs = total_current - total_bench_current
         bench_vs_pct = (bench_vs / total_bench_current * 100) if total_bench_current else 0.0
-        print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_bench_current:,.0f}", f"{bench_vs:+,.0f}", f"{bench_vs_pct:+.2f}%", f"{total_pnl_pct:+.2f}%"))
+        print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_bench_current:,.0f}", f"{bench_vs:+,.0f}", f"{bench_vs_pct:+.2f}%", f"{total_pnl_pct:+.2f}%", format_personal_30d(portfolio_xirr)))
     else:
-        print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%"))
+        print(col2.format(f"TOTAL ({fund_count})", "", "", avg_1m_str, avg_3m_str, "", f"{total_cost:,.0f}", f"{total_current:,.0f}", f"{total_pnl:+,.0f}", f"{total_pnl_pct:+.2f}%", format_personal_30d(portfolio_xirr)))
 
     print(f"\n  Total Invested : {total_cost:>14,.0f} TL")
     print(f"  Current Value  : {total_current:>14,.0f} TL")
@@ -815,30 +957,39 @@ def main():
         vs_bench = total_current - total_bench_current
         vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
         print(f"  Benchmark [{benchmark_code}]  : {total_bench_current:>14,.0f} TL  ({bench_pnl_pct:+.2f}%)")
-        print(f"  vs Benchmark   : {vs_bench:>+14,.0f} TL  ({vs_bench_pct:+.2f}%)")
+        print(f"  vs Benchmark (open positions): {vs_bench:>+14,.0f} TL  ({vs_bench_pct:+.2f}%)")
     # ── Daily returns (today and yesterday) ────────────────────────────────────
     history = [e for e in existing if e["date"] < today_str]  # exclude today
+    today_daily_gain = None
+    today_daily_pct = None
     if history:
         prev = history[-1]
-        new_capital = total_cost - prev["cost"]
-        today_gain = (total_current - prev["current"]) - new_capital
-        today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
+        today_daily_gain, today_daily_pct = compute_holding_period_return(
+            holdings, fund_data, prev["date"], today_str
+        )
         print(f"\n  Today's Daily Return: {today_daily_pct:>+7.2f}%  ({prev['date']} \u2192 {today_str})")
         if len(history) >= 2:
             prev2 = history[-2]
-            yest_new_capital = prev["cost"] - prev2["cost"]
-            yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
-            yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
+            if "daily_pct" in prev:
+                yest_daily_pct = prev["daily_pct"]
+            else:
+                yest_new_capital = prev["cost"] - prev2["cost"]
+                yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
+                yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
             print(f"  Yesterday's Return: {yest_daily_pct:>+7.2f}%  ({prev2['date']} → {prev['date']})")
 
     # Show recent daily returns so negative days are clearly visible
-    history_with_today = history + [{
+    today_history_entry = {
         "date": today_str,
         "cost": total_cost,
         "current": total_current,
         "pnl": total_pnl,
         "pnl_pct": total_pnl_pct,
-    }]
+    }
+    if today_daily_gain is not None:
+        today_history_entry["daily_gain"] = today_daily_gain
+        today_history_entry["daily_pct"] = today_daily_pct
+    history_with_today = history + [today_history_entry]
     recent_daily = compute_daily_return_series(history_with_today)[-7:]
     if recent_daily:
         print("\n  Recent Daily Returns (cash-flow adjusted):")
@@ -852,7 +1003,10 @@ def main():
             print(f"  - {m}")
     print()
 
-    save_history(today_str, total_cost, total_current, total_pnl, total_pnl_pct)
+    save_history(
+        today_str, total_cost, total_current, total_pnl, total_pnl_pct,
+        today_daily_gain, today_daily_pct,
+    )
     print_fund_performance_rankings(fund_summary, fund_data, top_n=3)
     write_pdf_report(
         holdings, fund_data, fund_summary,
@@ -861,6 +1015,8 @@ def main():
         benchmark_code=benchmark_code, bench_name=bench_name,
         total_bench_current=total_bench_current,
         fund_bench=fund_bench,
+        fund_xirr=fund_xirr,
+        portfolio_xirr=portfolio_xirr,
     )
 
 
@@ -868,7 +1024,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                      total_cost, total_current, total_pnl, total_pnl_pct,
                      missing_prices, today_str, today_capital=0.0,
                      benchmark_code="", bench_name="", total_bench_current=0.0,
-                     fund_bench=None):
+                     fund_bench=None, fund_xirr=None, portfolio_xirr=None):
     # ── Register fonts ─────────────────────────────────────────────────────────
     font_paths = [
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -962,25 +1118,33 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
         summary_data.append([td(f"Benchmark [{benchmark_code}]"), tdr(f"{total_bench_current:,.0f} TL  ({bench_pnl_pct:+.2f}%)")])
         vs_bench_str = f"{vs_bench:+,.0f} TL  ({vs_bench_pct:+.2f}%)"
-        summary_data.append([td("  ↳ vs Benchmark"), pnl_para(vs_bench_str, vs_bench)])
+        summary_data.append([td("vs Benchmark (open positions)"), pnl_para(vs_bench_str, vs_bench)])
     if today_entry and prev_entries:
         prev = prev_entries[-1]
         new_capital = today_entry["cost"] - prev["cost"]
-        today_gain = (today_entry["current"] - prev["current"]) - new_capital
-        today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
+        if "daily_gain" in today_entry:
+            today_gain = today_entry["daily_gain"]
+            today_daily_pct = today_entry["daily_pct"]
+        else:
+            today_gain = (today_entry["current"] - prev["current"]) - new_capital
+            today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
         today_daily_str = f"{today_gain:+,.0f} TL  ({today_daily_pct:+.2f}%)  (vs {prev['date']})"
         summary_data.append([td("Today's Daily Return"), pnl_para(today_daily_str, today_daily_pct, bold=True)])
         if abs(new_capital) > 0.01:
-            summary_data.append([td("  ↳ Net Capital Change"), tdr(f"{new_capital:+,.0f} TL")])
+            summary_data.append([td("Cost Basis Change"), tdr(f"{new_capital:+,.0f} TL")])
         if len(prev_entries) >= 2:
             prev2 = prev_entries[-2]
             yest_new_capital = prev["cost"] - prev2["cost"]
-            yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
-            yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
+            if "daily_gain" in prev:
+                yest_gain = prev["daily_gain"]
+                yest_daily_pct = prev["daily_pct"]
+            else:
+                yest_gain = (prev["current"] - prev2["current"]) - yest_new_capital
+                yest_daily_pct = (yest_gain / prev2["current"] * 100) if prev2["current"] else 0.0
             yest_daily_str = f"{yest_gain:+,.0f} TL  ({yest_daily_pct:+.2f}%)  (vs {prev2['date']})"
             summary_data.append([td("Yesterday's Return"), pnl_para(yest_daily_str, yest_daily_pct)])
             if abs(yest_new_capital) > 0.01:
-                summary_data.append([td("  ↳ Net Capital Change"), tdr(f"{yest_new_capital:+,.0f} TL")])
+                summary_data.append([td("Previous Cost Basis Change"), tdr(f"{yest_new_capital:+,.0f} TL")])
     summary_table = Table(summary_data, colWidths=[5*cm, 7*cm])
     summary_table.setStyle(TableStyle([
         ("BACKGROUND",  (0,0), (-1,0), HEADER_BG),
@@ -995,24 +1159,75 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     story.append(summary_table)
     story.append(Spacer(1, 0.6*cm))
 
+    # ── Bank totals table ──
+    bank_totals = calculate_bank_totals(holdings, fund_data, today_str)
+    if bank_totals:
+        story.append(Paragraph("Bank Totals", heading_style))
+        story.append(Spacer(1, 0.2*cm))
+        bank_rows = [[th("Bank"), th("Invested (TL)"), th("Current Value (TL)"),
+                      th("P&L (TL)"), th("Portfolio %")]]
+        for bank, values in sorted(
+            bank_totals.items(), key=lambda item: item[1]["current"], reverse=True
+        ):
+            bank_pnl = values["current"] - values["cost"]
+            allocation = (values["current"] / total_current * 100) if total_current else 0.0
+            bank_rows.append([
+                td(bank, bold=True),
+                tdr(f'{values["cost"]:,.0f}'),
+                tdr(f'{values["current"]:,.0f}', bold=True),
+                pnl_para(f"{bank_pnl:+,.0f}", bank_pnl),
+                tdr(f"{allocation:.1f}%"),
+            ])
+        bank_rows.append([
+            td(f"TOTAL ({len(bank_totals)})", bold=True),
+            tdr(f"{total_cost:,.0f}", bold=True),
+            tdr(f"{total_current:,.0f}", bold=True),
+            pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
+            tdr("100.0%", bold=True),
+        ])
+        bank_table = Table(
+            bank_rows,
+            colWidths=[4.0*cm, 3.2*cm, 3.7*cm, 3.2*cm, 2.8*cm],
+            repeatRows=1,
+        )
+        bank_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), HEADER_BG),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("ROWBACKGROUNDS", (0,1), (-1,-2), [colors.white, ALT_BG]),
+            ("BACKGROUND", (0,-1), (-1,-1), TOTAL_BG),
+            ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+            ("INNERGRID", (0,0), (-1,-1), 0.3, colors.lightgrey),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING", (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+            ("ALIGN", (1,0), (-1,-1), "RIGHT"),
+        ]))
+        story.append(bank_table)
+        story.append(Spacer(1, 0.6*cm))
+
     # ── Fund summary table ─────────────────────────────────────────────────────
     story.append(Paragraph("Fund Summary", heading_style))
     story.append(Spacer(1, 0.2*cm))
     _pdf_bench = fund_bench if fund_bench else {}
+    _pdf_xirr = fund_xirr if fund_xirr else {}
     if _pdf_bench:
         fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Days"), th("Shares"),
                        th("Buy Value"), th("Cur. Value"), th("P&L"), th("P&L %"),
-                       th("Bench Val"), th("vs Bench"), th("vs Bnch%")]
+                       th("Bench Val"), th("vs Bench"), th("vs Bnch%"), th("Personal 30D %")]
     else:
         fund_header = [th("Fund"), th("Fund Name"), th("Today %"), th("1M %"), th("3M %"), th("Days"), th("Shares"), th("Portfolio %"),
                        th("Buy Value"), th("Cur. Value"),
-                       th("P&L"), th("P&L %")]
+                       th("P&L"), th("P&L %"), th("Personal 30D %")]
     fund_rows = [fund_header]
     _pdf_1m_weight_sum = 0.0
     _pdf_1m_weighted_pct = 0.0
     _pdf_3m_weight_sum = 0.0
     _pdf_3m_weighted_pct = 0.0
-    for code in sorted(fund_summary.keys(), key=lambda c: fund_summary[c]["cost"], reverse=True):
+    for code in sorted(
+        fund_summary.keys(),
+        key=lambda c: _pdf_xirr.get(c) if _pdf_xirr.get(c) is not None else float("-inf"),
+        reverse=True,
+    ):
         s = fund_summary[code]
         pnl = s["current"] - s["cost"]
         pct = (pnl / s["cost"] * 100) if s["cost"] else 0.0
@@ -1065,6 +1280,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                 tdr(f"{b_cur:,.0f}") if b_cur else td("?"),
                 pnl_para(f"{vs_b:+,.0f}", vs_b) if vs_b is not None else td("?"),
                 pnl_para(f"{vs_b_pct:+.2f}%", vs_b_pct) if vs_b_pct is not None else td("?"),
+                pnl_para(format_personal_30d(_pdf_xirr.get(code)), _pdf_xirr[code]) if _pdf_xirr.get(code) is not None else td("—", align="RIGHT"),
             ])
         else:
             fund_rows.append([
@@ -1080,6 +1296,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                 tdr(f"{s['current']:,.0f}"),
                 pnl_para(f"{pnl:+,.0f}", pnl),
                 pnl_para(f"{pct:+.2f}%", pnl, bold=True),
+                pnl_para(format_personal_30d(_pdf_xirr.get(code)), _pdf_xirr[code]) if _pdf_xirr.get(code) is not None else td("—", align="RIGHT"),
             ])
     avg_1m_pdf = (_pdf_1m_weighted_pct / _pdf_1m_weight_sum) if _pdf_1m_weight_sum else None
     avg_1m_cell = pnl_para(f"{avg_1m_pdf:+.2f}%", avg_1m_pdf, bold=True) if avg_1m_pdf is not None else td("—", align="RIGHT")
@@ -1098,8 +1315,10 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             tdr(f"{total_bench_current:,.0f}", bold=True),
             pnl_para(f"{bench_vs:+,.0f}", bench_vs, bold=True),
             pnl_para(f"{bench_vs_pct:+.2f}%", bench_vs, bold=True),
+            pnl_para(format_personal_30d(portfolio_xirr), portfolio_xirr, bold=True) if portfolio_xirr is not None else td("—", align="RIGHT"),
         ])
-        fund_table = Table(fund_rows, colWidths=[1.2*cm, 3.7*cm, 1.5*cm, 1.5*cm, 1.5*cm, 1.2*cm, 1.5*cm, 2.3*cm, 2.3*cm, 2.1*cm, 1.7*cm, 2.3*cm, 2.1*cm, 1.5*cm])
+        fund_table = Table(fund_rows, colWidths=[1.2*cm, 3.0*cm, 1.5*cm, 1.5*cm, 1.5*cm, 1.2*cm, 1.5*cm, 2.0*cm, 2.0*cm, 1.8*cm, 1.7*cm, 2.3*cm, 2.1*cm, 1.5*cm, 1.5*cm])
+        pnl_pct_col = 10
     else:
         fund_rows.append([
             td(f"TOTAL ({fund_count})", bold=True), td(""), td(""), avg_1m_cell, avg_3m_cell, td(""), td(""), tdr("100.0%", bold=True),
@@ -1107,8 +1326,10 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             tdr(f"{total_current:,.0f}", bold=True),
             pnl_para(f"{total_pnl:+,.0f}", total_pnl, bold=True),
             pnl_para(f"{total_pnl_pct:+.2f}%", total_pnl, bold=True),
+            pnl_para(format_personal_30d(portfolio_xirr), portfolio_xirr, bold=True) if portfolio_xirr is not None else td("—", align="RIGHT"),
         ])
-        fund_table = Table(fund_rows, colWidths=[1.3*cm, 5.5*cm, 1.7*cm, 1.7*cm, 1.7*cm, 1.2*cm, 1.8*cm, 1.6*cm, 2.8*cm, 2.8*cm, 2.6*cm, 1.7*cm])
+        fund_table = Table(fund_rows, colWidths=[1.3*cm, 4.7*cm, 1.7*cm, 1.7*cm, 1.7*cm, 1.2*cm, 1.8*cm, 1.6*cm, 2.5*cm, 2.5*cm, 2.3*cm, 1.7*cm, 1.5*cm])
+        pnl_pct_col = 11
     bg_colors = []
     for i in range(1, len(fund_rows)-1):
         bg = colors.white if i % 2 == 1 else ALT_BG
@@ -1123,8 +1344,15 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ("TOPPADDING",   (0,0), (-1,-1), 3),
         ("BOTTOMPADDING",(0,0), (-1,-1), 3),
         ("ALIGN",        (2,0), (-1,-1), "RIGHT"),
+        ("LINEBEFORE",   (pnl_pct_col,0), (pnl_pct_col,-1), 1.2, colors.grey),
+        ("LINEAFTER",    (pnl_pct_col,0), (pnl_pct_col,-1), 1.2, colors.grey),
     ] + bg_colors))
     story.append(fund_table)
+    story.append(Spacer(1, 0.1*cm))
+    story.append(Paragraph(
+        "Personal 30D: 30-day equivalent personal return based on every purchase date and amount.",
+        style("xirr_note", 6, color=colors.grey),
+    ))
     story.append(Spacer(1, 0.6*cm))
 
     # ── Top/Bottom Performers tables ───────────────────────────────────────────
@@ -1360,12 +1588,17 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
 
     history = read_history()
     prev_entries = [e for e in history if e["date"] < date_str]
+    today_entry = next((e for e in history if e["date"] == date_str), None)
     day_change_str = ""
     if prev_entries:
         prev = prev_entries[-1]
-        new_capital = total_cost - prev["cost"]
-        day_delta = (total_current - prev["current"]) - new_capital
-        day_pct = (day_delta / prev["current"]) * 100 if prev["current"] else 0
+        if today_entry and "daily_gain" in today_entry:
+            day_delta = today_entry["daily_gain"]
+            day_pct = today_entry["daily_pct"]
+        else:
+            new_capital = total_cost - prev["cost"]
+            day_delta = (total_current - prev["current"]) - new_capital
+            day_pct = (day_delta / prev["current"]) * 100 if prev["current"] else 0
         arrow = "\u2191" if day_delta >= 0 else "\u2193"
         day_change_str = (
             f"\nToday's Daily Return ({prev['date']} \u2192 {date_str}): "
@@ -1373,9 +1606,13 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
         )
         if len(prev_entries) >= 2:
             prev2 = prev_entries[-2]
-            yest_new_capital = prev["cost"] - prev2["cost"]
-            yest_delta = (prev["current"] - prev2["current"]) - yest_new_capital
-            yest_pct = (yest_delta / prev2["current"]) * 100 if prev2["current"] else 0
+            if "daily_gain" in prev:
+                yest_delta = prev["daily_gain"]
+                yest_pct = prev["daily_pct"]
+            else:
+                yest_new_capital = prev["cost"] - prev2["cost"]
+                yest_delta = (prev["current"] - prev2["current"]) - yest_new_capital
+                yest_pct = (yest_delta / prev2["current"]) * 100 if prev2["current"] else 0
             yest_arrow = "↑" if yest_delta >= 0 else "↓"
             day_change_str += (
                 f"Yesterday's Return ({prev2['date']} → {prev['date']}): "
