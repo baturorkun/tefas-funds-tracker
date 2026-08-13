@@ -1,9 +1,12 @@
 import requests
 import math
+import os
+import shutil
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, timedelta
 from collections import defaultdict
+from xml.sax.saxutils import escape
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -21,11 +24,24 @@ HEADERS = {
 }
 
 
-def read_portfolio(filename="fon.dat", as_of=None):
+def backup_portfolio(filename="fon.dat", backup_filename="fon.dat.backup"):
+    """Create an atomic backup of the portfolio file before report generation."""
+    temp_backup = f"{backup_filename}.tmp"
+    try:
+        shutil.copy2(filename, temp_backup)
+        os.replace(temp_backup, backup_filename)
+    except Exception:
+        if os.path.exists(temp_backup):
+            os.remove(temp_backup)
+        raise
+
+
+def read_portfolio(filename="fon.dat", as_of=None, include_sold=False):
     """
     as_of: YYYY-MM-DD string. Holdings with sold_date < as_of are excluded
     (sold at end of sold_date, so they appear on sold_date but not after).
-    If as_of is None, all unsold holdings are returned.
+    If as_of is None, all unsold holdings are returned. Set include_sold=True
+    to return the full transaction history up to as_of.
     """
     holdings = []
     with open(filename, "r", encoding="utf-8") as f:
@@ -40,7 +56,7 @@ def read_portfolio(filename="fon.dat", as_of=None):
                 buy_date = parts[0].strip()
                 if as_of is not None and buy_date > as_of:
                     continue
-                if sold_date:
+                if sold_date and not include_sold:
                     if as_of is None or sold_date < as_of:
                         continue
                 holdings.append({
@@ -268,6 +284,49 @@ def calculate_bank_totals(holdings, fund_data, as_of):
         bank_totals[bank]["current"] += current_price * shares
 
     return bank_totals
+
+
+def calculate_realized_pnl(holdings, fund_data, as_of):
+    """Return realized P&L and closed-position details up to as_of.
+
+    The closest TEFAS price on or before sold_date is used as the sale price.
+    """
+    realized_total = 0.0
+    closed_positions = []
+    for holding in holdings:
+        sold_date = holding.get("sold_date", "")
+        # A holding remains in the open-position report through sold_date and
+        # becomes realized on the following report date.
+        if not sold_date or sold_date >= as_of:
+            continue
+
+        code = holding["fon_kodu"]
+        prices, _ = fund_data.get(code, ({}, code))
+        buy_price, used_buy_date = find_closest_price(prices, holding["alim_tarihi"])
+        sale_price, used_sale_date = find_closest_price(prices, sold_date)
+        if buy_price is None or sale_price is None:
+            continue
+
+        shares = holding["pay_adeti"]
+        cost = buy_price * shares
+        proceeds = sale_price * shares
+        pnl = proceeds - cost
+        realized_total += pnl
+        closed_positions.append({
+            "bank": holding.get("banka", "").strip() or "Unspecified",
+            "code": code,
+            "buy_date": holding["alim_tarihi"],
+            "used_buy_date": used_buy_date,
+            "sold_date": sold_date,
+            "used_sale_date": used_sale_date,
+            "shares": shares,
+            "cost": cost,
+            "proceeds": proceeds,
+            "pnl": pnl,
+            "pnl_pct": (pnl / cost * 100) if cost else 0.0,
+        })
+
+    return realized_total, closed_positions
 
 
 def personal_30d_return(xirr):
@@ -522,12 +581,17 @@ def compute_holding_period_return(holdings, fund_data, start_date, end_date):
     start_value = 0.0
     end_value = 0.0
     for holding in holdings:
+        buy_date = holding["alim_tarihi"]
+        sold_date = holding.get("sold_date", "")
+        if buy_date > end_date or (sold_date and sold_date <= start_date):
+            continue
         prices, _ = fund_data.get(holding["fon_kodu"], ({}, holding["fon_kodu"]))
         if not prices:
             continue
-        position_start = max(start_date, holding["alim_tarihi"])
+        position_start = max(start_date, buy_date)
+        position_end = min(end_date, sold_date) if sold_date else end_date
         start_price, _ = find_closest_price(prices, position_start)
-        end_price, _ = find_closest_price(prices, end_date)
+        end_price, _ = find_closest_price(prices, position_end)
         if start_price is None or end_price is None:
             continue
         shares = holding["pay_adeti"]
@@ -651,8 +715,6 @@ def main():
         today = datetime.now()
     today_str = today.strftime("%Y-%m-%d")
 
-    holdings = read_portfolio("fon.dat", as_of=today_str)
-
     if today.weekday() >= 5 and not args.force:  # 5=Saturday, 6=Sunday
         day_name = "Saturday" if today.weekday() == 5 else "Sunday"
         print(f"{today_str} is a {day_name} — TEFAS is closed. Skipping. (use --force to override)")
@@ -667,11 +729,17 @@ def main():
             return
         print(f"--force: regenerating report for {today_str}...")
 
+    backup_portfolio("fon.dat", "fon.dat.backup")
+    print("Portfolio backup created: fon.dat.backup")
+    holdings = read_portfolio("fon.dat", as_of=today_str)
+    all_holdings = read_portfolio("fon.dat", as_of=today_str, include_sold=True)
+
     print(f"\nTEFAS Portfolio P&L Report — {today_str}")
     print("=" * 115)
 
-    # Unique fund codes
-    fund_codes = sorted(set(h["fon_kodu"] for h in holdings))
+    # Fetch sold funds too so their realized P&L can be calculated.
+    active_fund_codes = sorted(set(h["fon_kodu"] for h in holdings))
+    fund_codes = sorted(set(h["fon_kodu"] for h in all_holdings))
 
     # Fetch prices
     print("Fetching fund prices...\n")
@@ -706,7 +774,7 @@ def main():
         print("\nFetching fund stats...\n")
         previous_fund_stats = read_fund_stats_history()
         fund_stats_rows = []
-        for code in fund_codes:
+        for code in active_fund_codes:
             print(f"  [{code}] stats ", end="", flush=True)
             stats = get_fund_stats(code)
             if not stats:
@@ -836,6 +904,14 @@ def main():
     print("-" * 115)
     total_pnl = total_current - total_cost
     total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0.0
+    realized_pnl, closed_positions = calculate_realized_pnl(
+        all_holdings, fund_data, today_str
+    )
+    combined_pnl = total_pnl + realized_pnl
+    combined_capital = total_cost - realized_pnl
+    combined_pnl_pct = (
+        combined_pnl / combined_capital * 100 if combined_capital else 0.0
+    )
     print(col.format(
         "TOTAL", "", "", "",
         "", "",
@@ -950,7 +1026,9 @@ def main():
 
     print(f"\n  Total Invested : {total_cost:>14,.0f} TL")
     print(f"  Current Value  : {total_current:>14,.0f} TL")
-    print(f"  Total P&L      : {total_pnl:>+14,.0f} TL  ({total_pnl_pct:+.2f}%)")
+    print(f"  Open P&L       : {total_pnl:>+14,.0f} TL  ({total_pnl_pct:+.2f}%)")
+    print(f"  Realized P&L   : {realized_pnl:>+14,.0f} TL")
+    print(f"  Combined P&L   : {combined_pnl:>+14,.0f} TL  ({combined_pnl_pct:+.2f}%)")
     if use_benchmark and total_bench_current > 0:
         bench_pnl = total_bench_current - total_cost
         bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
@@ -965,7 +1043,7 @@ def main():
     if history:
         prev = history[-1]
         today_daily_gain, today_daily_pct = compute_holding_period_return(
-            holdings, fund_data, prev["date"], today_str
+            all_holdings, fund_data, prev["date"], today_str
         )
         print(f"\n  Today's Daily Return: {today_daily_pct:>+7.2f}%  ({prev['date']} \u2192 {today_str})")
         if len(history) >= 2:
@@ -1017,6 +1095,8 @@ def main():
         fund_bench=fund_bench,
         fund_xirr=fund_xirr,
         portfolio_xirr=portfolio_xirr,
+        realized_pnl=realized_pnl,
+        closed_positions=closed_positions,
     )
 
 
@@ -1024,7 +1104,8 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                      total_cost, total_current, total_pnl, total_pnl_pct,
                      missing_prices, today_str, today_capital=0.0,
                      benchmark_code="", bench_name="", total_bench_current=0.0,
-                     fund_bench=None, fund_xirr=None, portfolio_xirr=None):
+                     fund_bench=None, fund_xirr=None, portfolio_xirr=None,
+                     realized_pnl=0.0, closed_positions=None):
     # ── Register fonts ─────────────────────────────────────────────────────────
     font_paths = [
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -1059,9 +1140,9 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     normal_style  = style("normal",   8)
     small_style   = style("small",    7)
 
-    def th(text): return Paragraph(f"<b>{text}</b>", style("th", 7, bold=True, color=colors.white))
+    def th(text): return Paragraph(f"<b>{escape(str(text))}</b>", style("th", 7, bold=True, color=colors.white))
     def td(text, bold=False, align="LEFT"):
-        return Paragraph(str(text), style("td", 7, bold=bold, align=align))
+        return Paragraph(escape(str(text)), style("td", 7, bold=bold, align=align))
     def tdr(text, bold=False):
         return td(text, bold=bold, align="RIGHT")
 
@@ -1071,10 +1152,10 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     GREEN_HEX = "#1a7a1a"
     RED_HEX   = "#c00000"
 
-    def pnl_para(text, val, bold=False, align="RIGHT"):
+    def pnl_para(text, val, bold=False, align="RIGHT", size=7):
         hex_color = GREEN_HEX if val >= 0 else RED_HEX
         return Paragraph(f'<font color="{hex_color}">{text}</font>',
-                         style("pnl", 7, bold=bold, align=align))
+                         style("pnl", size, bold=bold, align=align))
 
     # ── Document ───────────────────────────────────────────────────────────────
     import os
@@ -1085,12 +1166,13 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                             topMargin=1.5*cm, bottomMargin=1.5*cm)
     story = []
 
-    buy_dates = [datetime.strptime(h["alim_tarihi"], "%Y-%m-%d") for h in holdings]
-    oldest_date = min(buy_dates).strftime("%Y-%m-%d")
-    days_held = (datetime.strptime(today_str, "%Y-%m-%d") - min(buy_dates)).days
+    weighted_holding_days = sum(
+        summary.get("weighted_days", 0.0) for summary in fund_summary.values()
+    )
+    avg_holding_days = round(weighted_holding_days / total_cost) if total_cost else None
 
     # Title
-    story.append(Paragraph("TEFAS Portfolio P&L Report", title_style))
+    story.append(Paragraph("TEFAS Portfolio P&amp;L Report", title_style))
     story.append(Spacer(1, 0.3*cm))
     story.append(Paragraph(f"Date: {today_str}", style("sub", 9, align="CENTER")))
     story.append(Spacer(1, 0.5*cm))
@@ -1103,22 +1185,28 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     # ── Summary table ──────────────────────────────────────────────────────────
     story.append(Paragraph("Summary", heading_style))
     story.append(Spacer(1, 0.2*cm))
-    pnl_str = f"{total_pnl:+,.0f} TL  ({total_pnl_pct:+.2f}%)"
+    open_pnl_str = f"{total_pnl:+,.0f} TL  ({total_pnl_pct:+.2f}%)"
+    combined_pnl = total_pnl + realized_pnl
+    combined_capital = total_cost - realized_pnl
+    combined_pnl_pct = (
+        combined_pnl / combined_capital * 100 if combined_capital else 0.0
+    )
     summary_data = [
         [th(""), th("Value")],
-        [td("First Buy Date"), td(f"{oldest_date}  ({days_held} days ago)")],
+        [td("Avg. Holding Period"),
+         td(f"{avg_holding_days} days (weighted by invested amount)")
+         if avg_holding_days is not None else td("—")],
         [td("Total Invested"),  tdr(f"{total_cost:,.0f} TL")],
         [td("Current Value"),   tdr(f"{total_current:,.0f} TL")],
-        [td("Total P&L"), pnl_para(pnl_str, total_pnl, bold=True)],
+        [td("Open Positions P&L"), pnl_para(open_pnl_str, total_pnl)],
+        [td("Realized P&L (closed)"),
+         pnl_para(f"{realized_pnl:+,.0f} TL", realized_pnl)],
+        [td("Combined P&L"),
+         pnl_para(f"{combined_pnl:+,.0f} TL  ({combined_pnl_pct:+.2f}%)",
+                  combined_pnl, bold=True)],
     ]
-    if benchmark_code and total_bench_current > 0:
-        bench_pnl = total_bench_current - total_cost
-        bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
-        vs_bench = total_current - total_bench_current
-        vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
-        summary_data.append([td(f"Benchmark [{benchmark_code}]"), tdr(f"{total_bench_current:,.0f} TL  ({bench_pnl_pct:+.2f}%)")])
-        vs_bench_str = f"{vs_bench:+,.0f} TL  ({vs_bench_pct:+.2f}%)"
-        summary_data.append([td("vs Benchmark (open positions)"), pnl_para(vs_bench_str, vs_bench)])
+    today_return_row = None
+    cost_basis_rows = []
     if today_entry and prev_entries:
         prev = prev_entries[-1]
         new_capital = today_entry["cost"] - prev["cost"]
@@ -1129,9 +1217,13 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             today_gain = (today_entry["current"] - prev["current"]) - new_capital
             today_daily_pct = (today_gain / prev["current"] * 100) if prev["current"] else 0.0
         today_daily_str = f"{today_gain:+,.0f} TL  ({today_daily_pct:+.2f}%)  (vs {prev['date']})"
-        summary_data.append([td("Today's Daily Return"), pnl_para(today_daily_str, today_daily_pct, bold=True)])
+        today_return_row = len(summary_data)
+        summary_data.append([
+            td("Today's Daily Return", bold=True),
+            pnl_para(today_daily_str, today_daily_pct, bold=True, size=8),
+        ])
         if abs(new_capital) > 0.01:
-            summary_data.append([td("Cost Basis Change"), tdr(f"{new_capital:+,.0f} TL")])
+            cost_basis_rows.append([td("Cost Basis Change"), tdr(f"{new_capital:+,.0f} TL")])
         if len(prev_entries) >= 2:
             prev2 = prev_entries[-2]
             yest_new_capital = prev["cost"] - prev2["cost"]
@@ -1144,9 +1236,20 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             yest_daily_str = f"{yest_gain:+,.0f} TL  ({yest_daily_pct:+.2f}%)  (vs {prev2['date']})"
             summary_data.append([td("Yesterday's Return"), pnl_para(yest_daily_str, yest_daily_pct)])
             if abs(yest_new_capital) > 0.01:
-                summary_data.append([td("Previous Cost Basis Change"), tdr(f"{yest_new_capital:+,.0f} TL")])
-    summary_table = Table(summary_data, colWidths=[5*cm, 7*cm])
-    summary_table.setStyle(TableStyle([
+                cost_basis_rows.append([td("Previous Cost Basis Change"), tdr(f"{yest_new_capital:+,.0f} TL")])
+        summary_data.extend(cost_basis_rows)
+
+    # Benchmark belongs at the end: it is a reference, not a portfolio total.
+    if benchmark_code and total_bench_current > 0:
+        bench_pnl = total_bench_current - total_cost
+        bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
+        vs_bench = total_current - total_bench_current
+        vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
+        summary_data.append([td(f"Benchmark [{benchmark_code}]"), tdr(f"{total_bench_current:,.0f} TL  ({bench_pnl_pct:+.2f}%)")])
+        vs_bench_str = f"{vs_bench:+,.0f} TL  ({vs_bench_pct:+.2f}%)"
+        summary_data.append([td("vs Benchmark (open positions)"), pnl_para(vs_bench_str, vs_bench)])
+
+    summary_style = [
         ("BACKGROUND",  (0,0), (-1,0), HEADER_BG),
         ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
         ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, ALT_BG]),
@@ -1155,7 +1258,18 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
         ("TOPPADDING",  (0,0), (-1,-1), 3),
         ("BOTTOMPADDING",(0,0), (-1,-1), 3),
-    ]))
+    ]
+    if today_return_row is not None:
+        TODAY_BG = colors.HexColor("#fff2cc")
+        TODAY_BORDER = colors.HexColor("#d6a800")
+        summary_style.extend([
+            ("BACKGROUND", (0,today_return_row), (-1,today_return_row), TODAY_BG),
+            ("BOX", (0,today_return_row), (-1,today_return_row), 1.2, TODAY_BORDER),
+            ("TOPPADDING", (0,today_return_row), (-1,today_return_row), 5),
+            ("BOTTOMPADDING", (0,today_return_row), (-1,today_return_row), 5),
+        ])
+    summary_table = Table(summary_data, colWidths=[5*cm, 7*cm])
+    summary_table.setStyle(TableStyle(summary_style))
     story.append(summary_table)
     story.append(Spacer(1, 0.6*cm))
 
@@ -1446,7 +1560,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ]))
         return tbl
 
-    story.append(Paragraph("My Best / Worst (since buy — personal P&L %)", heading_style))
+    story.append(Paragraph("My Best / Worst (since buy — personal P&amp;L %)", heading_style))
     story.append(Spacer(1, 0.2*cm))
     story.append(make_personal_table(top5_personal, bottom5_personal))
     story.append(Spacer(1, 0.5*cm))
@@ -1484,6 +1598,62 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         story.append(Spacer(1, 0.2*cm))
         story.append(RLImage(chart_path, width=24*cm, height=9*cm))
         story.append(Spacer(1, 0.6*cm))
+
+    # ── Closed positions / realized P&L ──
+    closed_positions = closed_positions or []
+    closed_section = []
+    if closed_positions:
+        closed_section.append(Paragraph("Closed Positions — Realized P&amp;L", heading_style))
+        closed_section.append(Spacer(1, 0.2*cm))
+        closed_rows = [[
+            th("Bank"), th("Fund"), th("Buy Date"), th("Sold Date"), th("Shares"),
+            th("Buy Value"), th("Sale Value"), th("Realized P&L"), th("P&L %"),
+        ]]
+        for position in sorted(
+            closed_positions, key=lambda row: (row["sold_date"], row["code"]), reverse=True
+        ):
+            closed_rows.append([
+                td(position["bank"]), td(position["code"], bold=True),
+                td(position["buy_date"]), td(position["sold_date"]),
+                tdr(f'{position["shares"]:,}'),
+                tdr(f'{position["cost"]:,.0f}'),
+                tdr(f'{position["proceeds"]:,.0f}'),
+                pnl_para(f'{position["pnl"]:+,.0f}', position["pnl"]),
+                pnl_para(f'{position["pnl_pct"]:+.2f}%', position["pnl"]),
+            ])
+        realized_cost = sum(row["cost"] for row in closed_positions)
+        realized_proceeds = sum(row["proceeds"] for row in closed_positions)
+        closed_rows.append([
+            td(f"TOTAL ({len(closed_positions)})", bold=True), td(""), td(""), td(""), td(""),
+            tdr(f"{realized_cost:,.0f}", bold=True),
+            tdr(f"{realized_proceeds:,.0f}", bold=True),
+            pnl_para(f"{realized_pnl:+,.0f}", realized_pnl, bold=True), td(""),
+        ])
+        closed_table = Table(
+            closed_rows,
+            colWidths=[2.0*cm, 1.3*cm, 2.1*cm, 2.1*cm, 1.8*cm,
+                       2.6*cm, 2.6*cm, 2.8*cm, 1.8*cm],
+            repeatRows=1,
+        )
+        closed_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), HEADER_BG),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("ROWBACKGROUNDS", (0,1), (-1,-2), [colors.white, ALT_BG]),
+            ("BACKGROUND", (0,-1), (-1,-1), TOTAL_BG),
+            ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+            ("INNERGRID", (0,0), (-1,-1), 0.3, colors.lightgrey),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING", (0,0), (-1,-1), 2),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+            ("ALIGN", (4,0), (-1,-1), "RIGHT"),
+        ]))
+        closed_section.append(closed_table)
+        closed_section.append(Spacer(1, 0.1*cm))
+        closed_section.append(Paragraph(
+            "Sale values use the closest TEFAS price on or before the sold date.",
+            style("sale_note", 6, color=colors.grey),
+        ))
+        closed_section.append(Spacer(1, 0.6*cm))
 
     # ── Transaction detail table ───────────────────────────────────────────────
     story.append(Paragraph("Transaction Detail", heading_style))
@@ -1555,6 +1725,9 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ("ALIGN",        (3,0), (-1,-1), "RIGHT"),
     ] + tx_bg))
     story.append(tx_table)
+    if closed_section:
+        story.append(Spacer(1, 0.6*cm))
+        story.extend(closed_section)
     story.append(Spacer(1, 0.4*cm))
     story.append(Paragraph(
         f"Generated: {today_str} — Data source: tefas.gov.tr",
@@ -1563,10 +1736,14 @@ def write_pdf_report(holdings, fund_data, fund_summary,
 
     doc.build(story)
     print(f"PDF report generated: {filename}")
-    send_email(filename, today_str, total_cost, total_current, total_pnl, total_pnl_pct, today_capital)
+    send_email(
+        filename, today_str, total_cost, total_current, total_pnl, total_pnl_pct,
+        today_capital, realized_pnl,
+    )
 
 
-def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_pnl_pct, today_capital=0.0):
+def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_pnl_pct,
+               today_capital=0.0, realized_pnl=0.0):
     import os
     import smtplib
     from email.message import EmailMessage
@@ -1576,6 +1753,11 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
     smtp_user = os.environ.get("SMTP_USER", "")
     smtp_pass = os.environ.get("SMTP_PASS", "")
     to_addr   = os.environ.get("REPORT_TO", "batur@bilkent.edu.tr")
+    combined_pnl = total_pnl + realized_pnl
+    combined_capital = total_cost - realized_pnl
+    combined_pnl_pct = (
+        combined_pnl / combined_capital * 100 if combined_capital else 0.0
+    )
 
     if not smtp_user or not smtp_pass:
         print("Email not sent: SMTP_USER or SMTP_PASS not set.")
@@ -1622,7 +1804,9 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
     msg.set_content(
         f"Hi,\n\n"
         f"Please find attached the TEFAS portfolio report for {date_str}.\n\n"
-        f"Total P&L: {total_pnl:+,.0f} TL ({total_pnl_pct:+.2f}%)"
+        f"Open Positions P&L: {total_pnl:+,.0f} TL ({total_pnl_pct:+.2f}%)\n"
+        f"Realized P&L: {realized_pnl:+,.0f} TL\n"
+        f"Combined P&L: {combined_pnl:+,.0f} TL ({combined_pnl_pct:+.2f}%)"
         f"{day_change_str}\n"
     )
 

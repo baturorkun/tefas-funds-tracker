@@ -13,6 +13,7 @@ A daily portfolio profit/loss reporter for Turkish mutual funds. Fetches live fu
 - Highlights daily gainers/losers ≥1% in bold green/red
 - Generates a formatted PDF report with:
   - Portfolio summary (total invested, current value, P&L, daily returns)
+  - Separate open, realized, and combined P&L totals
   - Bank totals (invested amount, current value, P&L, and portfolio share)
   - Fund summary table with daily return and portfolio weight
   - Transaction detail table
@@ -35,10 +36,12 @@ cp fon.dat.sample fon.dat
 Edit `fon.dat` with your holdings:
 
 ```
-Date        Code    Amount  Bank
+Date        Code    Amount  Bank        Sold
 2026-01-10  TLY     24      Garanti
-2026-03-17  VPS     39412   YapiKredi
+2026-03-17  VPS     39412   YapiKredi   2026-08-06
 ```
+
+Closed-position sale values use the closest TEFAS price on or before `Sold`.
 
 ### 2. Create `.env`
 

@@ -1,4 +1,6 @@
 fon.dat
+fon.dat.backup
+fon.dat.backup.tmp
 reports/*
 .env
 __pycache__/
