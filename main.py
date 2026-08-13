@@ -38,8 +38,9 @@ def backup_portfolio(filename="fon.dat", backup_filename="fon.dat.backup"):
 
 def read_portfolio(filename="fon.dat", as_of=None, include_sold=False):
     """
-    as_of: YYYY-MM-DD string. Holdings with sold_date < as_of are excluded
-    (sold at end of sold_date, so they appear on sold_date but not after).
+    as_of: YYYY-MM-DD string. Purchases first appear on the day after buy_date.
+    Holdings with sold_date < as_of are excluded (sold at end of sold_date, so
+    they appear on sold_date but not after).
     If as_of is None, all unsold holdings are returned. Set include_sold=True
     to return the full transaction history up to as_of.
     """
@@ -54,7 +55,7 @@ def read_portfolio(filename="fon.dat", as_of=None, include_sold=False):
             if len(parts) >= 3:
                 sold_date = parts[4].strip() if len(parts) > 4 else ""
                 buy_date = parts[0].strip()
-                if as_of is not None and buy_date > as_of:
+                if as_of is not None and buy_date >= as_of:
                     continue
                 if sold_date and not include_sold:
                     if as_of is None or sold_date < as_of:
