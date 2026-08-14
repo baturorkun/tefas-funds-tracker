@@ -151,6 +151,37 @@ def find_closest_price_forward(prices, target_date_str):
     return None, None
 
 
+def validate_exact_report_prices(holdings, fund_data, as_of):
+    """Return errors for every exact transaction/report price required."""
+    required_dates = defaultdict(set)
+    for holding in holdings:
+        code = holding["fon_kodu"]
+        required_dates[code].add((holding["alim_tarihi"], "buy"))
+        sold_date = holding.get("sold_date", "")
+        if sold_date and sold_date < as_of:
+            required_dates[code].add((sold_date, "sale"))
+        else:
+            required_dates[code].add((as_of, "report"))
+
+    errors = []
+    for code in sorted(required_dates):
+        prices, name = fund_data.get(code, ({}, code))
+        for date_str, price_type in sorted(required_dates[code]):
+            price = prices.get(date_str)
+            if price is None:
+                latest = max(prices) if prices else "no data"
+                errors.append(
+                    f"[{code}] {name[:50]} — exact {price_type} price missing "
+                    f"for {date_str} (latest available: {latest})"
+                )
+            elif price <= 0:
+                errors.append(
+                    f"[{code}] {name[:50]} — invalid {price_type} price "
+                    f"{price:g} for {date_str}"
+                )
+    return errors
+
+
 def fund_monthly_return(prices):
     """
     Returns (pct, today_price, price_1m_ago) for the ~30-day window.
@@ -760,11 +791,15 @@ def main():
             print("NO DATA")
             price_errors.append(f"[{code}] — no price data returned")
 
+    price_errors.extend(
+        validate_exact_report_prices(all_holdings, fund_data, today_str)
+    )
+
     if price_errors:
-        print("\n⛔ Aborting: uncertain prices detected — report not generated.")
-        for err in price_errors:
+        print("\n⛔ Aborting: exact required prices are unavailable — report not generated.")
+        for err in dict.fromkeys(price_errors):
             print(f"  ✗ {err}")
-        return
+        raise SystemExit(1)
 
     latest_data_dates = [
         max(prices.keys()) for prices, _ in fund_data.values()
@@ -818,6 +853,31 @@ def main():
             else:
                 print("NO DATA")
 
+        benchmark_errors = []
+        if not use_benchmark:
+            benchmark_errors.append(
+                f"[{benchmark_code}] benchmark — no price data returned"
+            )
+        else:
+            if not bench_prices.get(today_str):
+                latest = max(bench_prices) if bench_prices else "no data"
+                benchmark_errors.append(
+                    f"[{benchmark_code}] benchmark — exact report price missing "
+                    f"for {today_str} (latest available: {latest})"
+                )
+            for holding in holdings:
+                buy_date = holding["alim_tarihi"]
+                if not bench_prices.get(buy_date):
+                    benchmark_errors.append(
+                        f"[{benchmark_code}] benchmark — exact comparison price "
+                        f"missing for buy date {buy_date}"
+                    )
+        if benchmark_errors:
+            print("\n⛔ Aborting: exact benchmark prices are unavailable — report not generated.")
+            for err in dict.fromkeys(benchmark_errors):
+                print(f"  ✗ {err}")
+            raise SystemExit(1)
+
     print()
 
     # ── Per-transaction table ──────────────────────────────────────────────────
@@ -851,8 +911,9 @@ def main():
         # Buy price: exact date or nearest previous trading day
         buy_price, used_buy_date = find_closest_price(prices, buy_date)
 
-        # Current price: price on the target date (or nearest previous trading day)
-        current_price, latest_date = find_closest_price(prices, today_str)
+        # Exact target-date price; preflight validation aborts if unavailable.
+        current_price = prices.get(today_str)
+        latest_date = today_str if current_price is not None else None
 
         if buy_price is not None and current_price is not None:
             cost = buy_price * shares
@@ -868,7 +929,7 @@ def main():
             bench_cur = None
             if use_benchmark:
                 bench_bp, _ = find_closest_price(bench_prices, buy_date)
-                bench_tp, _ = find_closest_price(bench_prices, today_str)
+                bench_tp = bench_prices.get(today_str)
                 if bench_bp and bench_tp and bench_bp > 0:
                     bench_cur = (cost / bench_bp) * bench_tp
                     total_bench_current += bench_cur
@@ -1671,7 +1732,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         bank = h["banka"]
         prices, _ = fund_data.get(code, ({}, code))
         buy_price, used_buy_date = find_closest_price(prices, buy_date)
-        current_price = prices[max(prices.keys())] if prices else None
+        current_price = prices.get(today_str)
         if buy_price is not None and current_price is not None:
             cost = buy_price * shares
             current_val = current_price * shares
