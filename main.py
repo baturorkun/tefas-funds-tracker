@@ -106,6 +106,7 @@ def get_fund_stats(fund_code):
         return {
             "code": item.get("fonKodu", fund_code),
             "name": item.get("fonUnvan", fund_code),
+            "category": item.get("fonKategori", "Diğer"),
             "participant_count": int(item.get("yatirimciSayi") or 0),
             "fund_size": float(item.get("portBuyukluk") or 0.0),
             "outstanding_shares": int(item.get("payAdet") or 0),
@@ -297,6 +298,59 @@ def calculate_fund_xirrs(holdings, fund_data, as_of):
         portfolio_flows.extend(flows)
         portfolio_flows.append(terminal)
     return fund_xirr, calculate_xirr(portfolio_flows)
+
+
+def infer_theme_from_name(fund_name):
+    name_upper = fund_name.upper()
+    if "BLOCKCHAIN" in name_upper or "BLOKZİNCİR" in name_upper or "BLOK ZİNCİR" in name_upper or "DİJİTAL VARLIK" in name_upper:
+        return "Blockchain / Dijital Varlıklar"
+    if "TEKNOLOJİ" in name_upper or "BİLİŞİM" in name_upper or "DİJİTAL" in name_upper:
+        return "Teknoloji"
+    if "YABANCI" in name_upper:
+        return "Yabancı"
+    if "ALTIN" in name_upper or "KIYMETLİ MADENLER" in name_upper or "GÜMÜŞ" in name_upper:
+        return "Kıymetli Madenler"
+    if "SÜRDÜRÜLEBİLİRLİK" in name_upper:
+        return "Sürdürülebilirlik"
+    if "HİSSE" in name_upper and "YABANCI" not in name_upper:
+        return "Yerli Hisse"
+    if "TEMETTÜ" in name_upper:
+        return "Temettü"
+    if "BİRİNCİ" in name_upper or "PARA PİYASASI" in name_upper or "BORÇLANMA" in name_upper or "KİRA SERTİFİKALARI" in name_upper:
+        return "Sabit Getirili / Borçlanma"
+    return "Karma / Diğer"
+
+
+def calculate_portfolio_allocations(holdings, fund_data, fund_categories, as_of):
+    allocations = {
+        "category": defaultdict(lambda: {"cost": 0.0, "current": 0.0, "funds": set()}),
+        "theme": defaultdict(lambda: {"cost": 0.0, "current": 0.0, "funds": set()}),
+    }
+    
+    for holding in holdings:
+        code = holding["fon_kodu"]
+        prices, fund_name = fund_data.get(code, ({}, code))
+        buy_price, _ = find_closest_price(prices, holding["alim_tarihi"])
+        current_price, _ = find_closest_price(prices, as_of)
+        if buy_price is None or current_price is None:
+            continue
+
+        shares = holding["pay_adeti"]
+        cost = buy_price * shares
+        current_val = current_price * shares
+        
+        cat = fund_categories.get(code, "Diğer")
+        theme = infer_theme_from_name(fund_name)
+        
+        allocations["category"][cat]["cost"] += cost
+        allocations["category"][cat]["current"] += current_val
+        allocations["category"][cat]["funds"].add(code)
+        
+        allocations["theme"][theme]["cost"] += cost
+        allocations["theme"][theme]["current"] += current_val
+        allocations["theme"][theme]["funds"].add(code)
+        
+    return allocations
 
 
 def calculate_bank_totals(holdings, fund_data, as_of):
@@ -806,6 +860,9 @@ def main():
         if prices
     ]
     latest_data_date = max(latest_data_dates) if latest_data_dates else today_str
+    
+    fund_categories = {}
+    
     if not args.date or today_str == latest_data_date:
         print("\nFetching fund stats...\n")
         previous_fund_stats = read_fund_stats_history()
@@ -816,6 +873,7 @@ def main():
             if not stats:
                 print("NO DATA")
                 continue
+            fund_categories[code] = stats.get("category", "Diğer")
             prices, _ = fund_data.get(code, ({}, code))
             stats["date"] = max(prices.keys()) if prices else latest_data_date
             fund_stats_rows.append(stats)
@@ -833,6 +891,10 @@ def main():
             f"\nSkipping fund stats for historical report date {today_str}; "
             f"TEFAS latest stats date appears to be {latest_data_date}."
         )
+        print("Fetching fund categories for historical report...")
+        for code in active_fund_codes:
+            stats = get_fund_stats(code)
+            fund_categories[code] = stats.get("category", "Diğer") if stats else "Diğer"
 
     # ── Benchmark fund ─────────────────────────────────────────────────────────
     benchmark_code = os.environ.get("BENCHMARK_FUND", "").strip().upper()
@@ -1137,6 +1199,20 @@ def main():
             print(f"    {d['date']}: {d['daily_pct']:+.2f}%  ({d['daily_gain']:+,.0f} TL)")
     print()
 
+    allocations = calculate_portfolio_allocations(holdings, fund_data, fund_categories, today_str)
+    
+    print("=" * 115)
+    print("PORTFÖY DAĞILIMI (TEMA)")
+    cat_col = "{:<30} {:>15} {:>15}   {:<50}"
+    print(cat_col.format("Tema", "Ağırlık (%)", "Değer (TL)", "İçeren Fonlar"))
+    print("-" * 115)
+    for theme, data in sorted(allocations["theme"].items(), key=lambda x: x[1]["current"], reverse=True):
+        weight = (data["current"] / total_current * 100) if total_current else 0.0
+        funds_str = ", ".join(sorted(data["funds"]))
+        print(cat_col.format(theme[:30], f"{weight:.2f}%", f"{data['current']:,.0f}", funds_str[:50]))
+    print("=" * 115)
+    print()
+
     if missing_prices:
         print("* Rows with missing prices:")
         for m in missing_prices:
@@ -1159,6 +1235,7 @@ def main():
         portfolio_xirr=portfolio_xirr,
         realized_pnl=realized_pnl,
         closed_positions=closed_positions,
+        allocations=allocations,
     )
 
 
@@ -1167,7 +1244,7 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                      missing_prices, today_str, today_capital=0.0,
                      benchmark_code="", bench_name="", total_bench_current=0.0,
                      fund_bench=None, fund_xirr=None, portfolio_xirr=None,
-                     realized_pnl=0.0, closed_positions=None):
+                     realized_pnl=0.0, closed_positions=None, allocations=None):
     # ── Register fonts ─────────────────────────────────────────────────────────
     font_paths = [
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -1379,6 +1456,36 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             ("ALIGN", (1,0), (-1,-1), "RIGHT"),
         ]))
         story.append(bank_table)
+        story.append(Spacer(1, 0.6*cm))
+
+    # ── Theme Allocations ──
+    if allocations:
+        # Theme
+        story.append(Paragraph("Portfolio Allocation", heading_style))
+        story.append(Spacer(1, 0.2*cm))
+        theme_rows = [[th("Theme"), th("Weight (%)"), th("Value (TL)"), th("Funds")]]
+        for theme, data in sorted(allocations["theme"].items(), key=lambda x: x[1]["current"], reverse=True):
+            weight = (data["current"] / total_current * 100) if total_current else 0.0
+            funds_str = ", ".join(sorted(data["funds"]))
+            theme_rows.append([
+                td(theme, bold=True),
+                tdr(f"{weight:.1f}%"),
+                tdr(f"{data['current']:,.0f}"),
+                td(funds_str[:50]),
+            ])
+        theme_table = Table(theme_rows, colWidths=[5.0*cm, 2.5*cm, 3.0*cm, 7.5*cm], repeatRows=1)
+        theme_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), HEADER_BG),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, ALT_BG]),
+            ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+            ("INNERGRID", (0,0), (-1,-1), 0.3, colors.lightgrey),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING", (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+            ("ALIGN", (1,0), (2,-1), "RIGHT"),
+        ]))
+        story.append(theme_table)
         story.append(Spacer(1, 0.6*cm))
 
     # ── Fund summary table ─────────────────────────────────────────────────────
