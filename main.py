@@ -11,7 +11,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -676,6 +676,10 @@ def compute_holding_period_return(holdings, fund_data, start_date, end_date):
             continue
         position_start = max(start_date, buy_date)
         position_end = min(end_date, sold_date) if sold_date else end_date
+        if position_start >= position_end:
+            # Bought (or sold) on the closing day: no exposure to this period,
+            # so counting it would only pad the denominator.
+            continue
         start_price, _ = find_closest_price(prices, position_start)
         end_price, _ = find_closest_price(prices, position_end)
         if start_price is None or end_price is None:
@@ -687,6 +691,162 @@ def compute_holding_period_return(holdings, fund_data, start_date, end_date):
     gain = end_value - start_value
     pct = (gain / start_value * 100) if start_value else 0.0
     return gain, pct
+
+
+def cost_basis_change(holdings, closed_positions, fund_data, prev_date, as_of):
+    """Split the move in open cost basis into money added and money released.
+
+    A purchase first appears on the report the day after its buy date, so a buy
+    dated on the previous report date is new to this one.
+    """
+    added = 0.0
+    for holding in holdings:
+        if not (prev_date <= holding["alim_tarihi"] < as_of):
+            continue
+        prices, _ = fund_data.get(holding["fon_kodu"], ({}, None))
+        price, _ = find_closest_price(prices, holding["alim_tarihi"])
+        if price:
+            added += price * holding["pay_adeti"]
+    released = sum(position["cost"] for position in closed_positions
+                   if prev_date <= position["sold_date"] < as_of)
+    return added, released
+
+
+def benchmark_closed_proceeds(closed_positions, bench_prices):
+    """What the closed positions' money would have returned in the benchmark.
+
+    Each closed trade is mirrored: the same amount buys the benchmark on the
+    buy date and is sold on the same sale date, so the comparison rests on the
+    identical cash-flow schedule instead of crediting the benchmark a holding
+    period the money never had.
+    """
+    proceeds = 0.0
+    for position in closed_positions:
+        bench_buy, _ = find_closest_price(bench_prices, position["buy_date"])
+        bench_sale, _ = find_closest_price(bench_prices, position["sold_date"])
+        if not bench_buy or not bench_sale:
+            continue
+        proceeds += position["cost"] / bench_buy * bench_sale
+    return proceeds
+
+
+def compute_benchmark_period_return(holdings, fund_data, bench_prices,
+                                    start_date, end_date):
+    """The benchmark's return over the same positions, weights and entry dates.
+
+    Comparing against the benchmark's plain calendar return would be unfair:
+    money that entered mid-period was only exposed for part of it, while the
+    benchmark would be credited the whole period. So each position's starting
+    value is instead invested in the benchmark on the same day the position
+    started, and sold when the position ended.
+    """
+    start_value = 0.0
+    end_value = 0.0
+    for holding in holdings:
+        buy_date = holding["alim_tarihi"]
+        sold_date = holding.get("sold_date", "")
+        if buy_date > end_date or (sold_date and sold_date <= start_date):
+            continue
+        prices, _ = fund_data.get(holding["fon_kodu"], ({}, holding["fon_kodu"]))
+        if not prices:
+            continue
+        position_start = max(start_date, buy_date)
+        position_end = min(end_date, sold_date) if sold_date else end_date
+        if position_start >= position_end:
+            continue
+        fund_price, _ = find_closest_price(prices, position_start)
+        if fund_price is None:
+            continue
+        exposure = fund_price * holding["pay_adeti"]
+        bench_open, _ = find_closest_price(bench_prices, position_start)
+        bench_close, _ = find_closest_price(bench_prices, position_end)
+        if not bench_open or not bench_close:
+            continue
+        start_value += exposure
+        end_value += exposure / bench_open * bench_close
+
+    if not start_value:
+        return None
+    return (end_value / start_value - 1) * 100
+
+
+MAX_WEEKS_PER_MONTH = 4
+
+
+def compute_period_returns(holdings, fund_data, end_date, bench_prices=None):
+    """Month-by-month P&L, each month broken into at most four trading weeks.
+
+    Weeks are cut backwards from the month's last trading day in blocks of five
+    trading days; whatever is left at the head of the month is folded into the
+    first week, so a month never shows a stray fifth week. Every period is
+    measured from the close preceding it, which makes a month's total the exact
+    sum of its weeks. ``compute_holding_period_return`` does the measuring, so
+    purchases and sales inside a window cannot masquerade as return.
+
+    When ``bench_prices`` is given, each period also carries the benchmark
+    fund's return over the same span and the difference in percentage points.
+
+    Returns months newest-first, each with its weeks newest-first, ready to
+    render top-to-bottom.
+    """
+    try:
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        return []
+
+    buy_dates = [h["alim_tarihi"] for h in holdings if h["alim_tarihi"] <= end_date]
+    if not buy_dates:
+        return []
+    first = datetime.strptime(min(buy_dates), "%Y-%m-%d")
+
+    trading_days = sorted({d for prices, _ in fund_data.values() for d in prices})
+
+    def measure(period_start, period_end):
+        reference = (datetime.strptime(period_start, "%Y-%m-%d")
+                     - timedelta(days=1)).strftime("%Y-%m-%d")
+        gain, pct = compute_holding_period_return(
+            holdings, fund_data, reference, period_end
+        )
+        bench_pct = None
+        if bench_prices:
+            bench_pct = compute_benchmark_period_return(
+                holdings, fund_data, bench_prices, reference, period_end
+            )
+        diff = (pct - bench_pct) if bench_pct is not None else None
+        return {"gain": gain, "pct": pct, "bench_pct": bench_pct, "diff": diff}
+
+    months = []
+    month = first.replace(day=1)
+    while month <= end:
+        following = (month.replace(year=month.year + 1, month=1)
+                     if month.month == 12 else month.replace(month=month.month + 1))
+        month_start = max(month, first).strftime("%Y-%m-%d")
+        month_end = min(following - timedelta(days=1), end).strftime("%Y-%m-%d")
+        month_result = measure(month_start, month_end)
+
+        days = [d for d in trading_days if month_start <= d <= month_end]
+        blocks = []
+        cut = len(days)
+        while cut > 0:
+            last_allowed = len(blocks) == MAX_WEEKS_PER_MONTH - 1
+            head = 0 if last_allowed else max(0, cut - 5)
+            blocks.append(days[head:cut])
+            cut = head
+        blocks.reverse()
+
+        weeks = []
+        for number, block in enumerate(blocks, start=1):
+            week = measure(block[0], block[-1])
+            week["label"] = f"{month.strftime('%b')} {number}w"
+            weeks.append(week)
+
+        month_result["label"] = month.strftime("%b %Y")
+        month_result["weeks"] = list(reversed(weeks))
+        months.append(month_result)
+        month = following
+
+    months.reverse()
+    return months
 
 
 def compute_daily_return_series(entries):
@@ -1034,8 +1194,52 @@ def main():
     combined_pnl = total_pnl + realized_pnl
     combined_capital = total_cost - realized_pnl
     combined_pnl_pct = (
-        combined_pnl / combined_capital * 100 if combined_capital else 0.0
+        combined_pnl / combined_capital * 100
+        if abs(combined_capital) > 1.0 else 0.0
     )
+
+    # Benchmark comparison over everything held so far, not just what is still
+    # open: the closed trades are mirrored into the benchmark on the same dates.
+    closed_cost = sum(c["cost"] for c in closed_positions)
+    closed_proceeds = sum(c["proceeds"] for c in closed_positions)
+    gross_purchases = total_cost + closed_cost
+
+    # Average holding period, kept separate for open and closed positions so
+    # neither hides the other's behaviour.
+    closed_weighted_days = sum(
+        c["cost"] * (datetime.strptime(c["sold_date"], "%Y-%m-%d")
+                     - datetime.strptime(c["buy_date"], "%Y-%m-%d")).days
+        for c in closed_positions
+    )
+    avg_closed_days = (round(closed_weighted_days / closed_cost)
+                       if closed_cost else None)
+
+    # How much of the portfolio is the benchmark fund itself — that slice
+    # compares against itself and pulls any gap toward zero.
+    bench_self_cost = 0.0
+    if use_benchmark:
+        for h in holdings:
+            if h["fon_kodu"] != benchmark_code:
+                continue
+            prices, _ = fund_data.get(benchmark_code, ({}, None))
+            price, _ = find_closest_price(prices, h["alim_tarihi"])
+            if price:
+                bench_self_cost += price * h["pay_adeti"]
+    bench_self_pct = (bench_self_cost / total_cost * 100) if total_cost else 0.0
+    bench_closed = (benchmark_closed_proceeds(closed_positions, bench_prices)
+                    if use_benchmark else 0.0)
+    total_bench_wealth = total_bench_current + bench_closed
+    total_wealth = total_current + closed_proceeds
+    total_bench_cost = total_cost + closed_cost
+    vs_bench_all = total_wealth - total_bench_wealth
+    # Both percentages hang off combined_capital, the same base Combined P&L
+    # uses, so the two rows can be read against each other directly.
+    bench_pnl_all = total_bench_wealth - total_bench_cost
+    bench_pnl_all_pct = (bench_pnl_all / combined_capital * 100) if combined_capital else 0.0
+    vs_bench_all_pct = (vs_bench_all / combined_capital * 100) if combined_capital else 0.0
+    vs_bench_open = total_current - total_bench_current
+    vs_bench_closed = closed_proceeds - bench_closed
+
     print(col.format(
         "TOTAL", "", "", "",
         "", "",
@@ -1153,13 +1357,11 @@ def main():
     print(f"  Open P&L       : {total_pnl:>+14,.0f} TL  ({total_pnl_pct:+.2f}%)")
     print(f"  Realized P&L   : {realized_pnl:>+14,.0f} TL")
     print(f"  Combined P&L   : {combined_pnl:>+14,.0f} TL  ({combined_pnl_pct:+.2f}%)")
-    if use_benchmark and total_bench_current > 0:
-        bench_pnl = total_bench_current - total_cost
-        bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
-        vs_bench = total_current - total_bench_current
-        vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
-        print(f"  Benchmark [{benchmark_code}]  : {total_bench_current:>14,.0f} TL  ({bench_pnl_pct:+.2f}%)")
-        print(f"  vs Benchmark (open positions): {vs_bench:>+14,.0f} TL  ({vs_bench_pct:+.2f}%)")
+    if use_benchmark and total_bench_wealth > 0:
+        print(f"  Benchmark [{benchmark_code}] P&L    : {bench_pnl_all:>+14,.0f} TL  ({bench_pnl_all_pct:+.2f}%)")
+        print(f"  vs Benchmark (all positions) : {vs_bench_all:>+14,.0f} TL  ({vs_bench_all_pct:+.2f}%)")
+        print(f"      open positions           : {vs_bench_open:>+14,.0f} TL")
+        print(f"      closed positions         : {vs_bench_closed:>+14,.0f} TL")
     # ── Daily returns (today and yesterday) ────────────────────────────────────
     history = [e for e in existing if e["date"] < today_str]  # exclude today
     today_daily_gain = None
@@ -1199,6 +1401,10 @@ def main():
             print(f"    {d['date']}: {d['daily_pct']:+.2f}%  ({d['daily_gain']:+,.0f} TL)")
     print()
 
+    period_returns = compute_period_returns(
+        all_holdings, fund_data, today_str, bench_prices if use_benchmark else None
+    )
+
     allocations = calculate_portfolio_allocations(holdings, fund_data, fund_categories, today_str)
     
     print("=" * 115)
@@ -1224,6 +1430,29 @@ def main():
         today_daily_gain, today_daily_pct,
     )
     print_fund_performance_rankings(fund_summary, fund_data, top_n=3)
+
+    # ── Monthly & weekly P&L vs benchmark (newest first) ───────────────────────
+    if period_returns:
+        bench_label = f"{benchmark_code} (%)" if use_benchmark else "Bench (%)"
+        per_col = "{:<16} {:>14} {:>12} {:>12} {:>12}"
+        print("=" * 115)
+        print("MONTHLY & WEEKLY P&L")
+        print(per_col.format("Period", "P&L (TL)", "Return (%)", bench_label, "Diff (pp)"))
+        print("-" * 115)
+
+        def period_row(label, row):
+            bench = f"{row['bench_pct']:+.2f}%" if row.get("bench_pct") is not None else "\u2014"
+            diff = f"{row['diff']:+.2f}" if row.get("diff") is not None else "\u2014"
+            return per_col.format(label, f"{row['gain']:+,.0f}",
+                                  f"{row['pct']:+.2f}%", bench, diff)
+
+        for m in period_returns:
+            print(period_row(m["label"], m))
+            for w in m["weeks"]:
+                print(period_row(f"  {w['label']}", w))
+        print("=" * 115)
+        print()
+
     write_pdf_report(
         holdings, fund_data, fund_summary,
         total_cost, total_current, total_pnl, total_pnl_pct,
@@ -1236,6 +1465,21 @@ def main():
         realized_pnl=realized_pnl,
         closed_positions=closed_positions,
         allocations=allocations,
+        period_returns=period_returns,
+        total_bench_wealth=total_bench_wealth,
+        total_bench_cost=total_bench_cost,
+        bench_pnl_all=bench_pnl_all,
+        bench_pnl_all_pct=bench_pnl_all_pct,
+        gross_purchases=gross_purchases,
+        combined_capital=combined_capital,
+        avg_closed_days=avg_closed_days,
+        bench_self_cost=bench_self_cost,
+        bench_self_pct=bench_self_pct,
+        closed_count=len(closed_positions),
+        vs_bench_all=vs_bench_all,
+        vs_bench_all_pct=vs_bench_all_pct,
+        vs_bench_open=vs_bench_open,
+        vs_bench_closed=vs_bench_closed,
     )
 
 
@@ -1244,7 +1488,14 @@ def write_pdf_report(holdings, fund_data, fund_summary,
                      missing_prices, today_str, today_capital=0.0,
                      benchmark_code="", bench_name="", total_bench_current=0.0,
                      fund_bench=None, fund_xirr=None, portfolio_xirr=None,
-                     realized_pnl=0.0, closed_positions=None, allocations=None):
+                     realized_pnl=0.0, closed_positions=None, allocations=None,
+                     period_returns=None, total_bench_wealth=0.0,
+                     total_bench_cost=0.0, bench_pnl_all=0.0, bench_pnl_all_pct=0.0,
+                     vs_bench_all=0.0, vs_bench_all_pct=0.0,
+                     vs_bench_open=0.0, vs_bench_closed=0.0,
+                     gross_purchases=0.0, combined_capital=0.0,
+                     avg_closed_days=None, bench_self_cost=0.0,
+                     bench_self_pct=0.0, closed_count=0):
     # ── Register fonts ─────────────────────────────────────────────────────────
     font_paths = [
         ("/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -1328,18 +1579,25 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     combined_pnl = total_pnl + realized_pnl
     combined_capital = total_cost - realized_pnl
     combined_pnl_pct = (
-        combined_pnl / combined_capital * 100 if combined_capital else 0.0
+        combined_pnl / combined_capital * 100
+        if abs(combined_capital) > 1.0 else 0.0
     )
+    holding_period_text = (
+        f"{avg_holding_days} days open"
+        + (f", {avg_closed_days} days closed ({closed_count} trades)"
+           if avg_closed_days is not None else "")
+        + " (weighted by invested amount)"
+    ) if avg_holding_days is not None else "—"
     summary_data = [
         [th(""), th("Value")],
-        [td("Avg. Holding Period"),
-         td(f"{avg_holding_days} days (weighted by invested amount)")
-         if avg_holding_days is not None else td("—")],
-        [td("Total Invested"),  tdr(f"{total_cost:,.0f} TL")],
-        [td("Current Value"),   tdr(f"{total_current:,.0f} TL")],
+        [td("Avg. Holding Period"), td(holding_period_text)],
+        [td("Gross Purchases (open + closed)"), tdr(f"{gross_purchases:,.0f} TL")],
+        [td("Total Invested (open positions)"),  tdr(f"{total_cost:,.0f} TL")],
+        [td("Current Value (open positions)"),   tdr(f"{total_current:,.0f} TL")],
         [td("Open Positions P&L"), pnl_para(open_pnl_str, total_pnl)],
         [td("Realized P&L (closed)"),
          pnl_para(f"{realized_pnl:+,.0f} TL", realized_pnl)],
+        [td("Net Capital Contributed"), tdr(f"{combined_capital:,.0f} TL")],
         [td("Combined P&L"),
          pnl_para(f"{combined_pnl:+,.0f} TL  ({combined_pnl_pct:+.2f}%)",
                   combined_pnl, bold=True)],
@@ -1363,6 +1621,15 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         ])
         if abs(new_capital) > 0.01:
             cost_basis_rows.append([td("Cost Basis Change"), tdr(f"{new_capital:+,.0f} TL")])
+            added, released = cost_basis_change(
+                holdings, closed_positions or [], fund_data, prev["date"], today_str
+            )
+            if added > 0.01:
+                cost_basis_rows.append(
+                    [td("    \u00b7 new purchases"), tdr(f"+{added:,.0f} TL")])
+            if released > 0.01:
+                cost_basis_rows.append(
+                    [td("    \u00b7 positions closed out"), tdr(f"-{released:,.0f} TL")])
         if len(prev_entries) >= 2:
             prev2 = prev_entries[-2]
             yest_new_capital = prev["cost"] - prev2["cost"]
@@ -1379,14 +1646,28 @@ def write_pdf_report(holdings, fund_data, fund_summary,
         summary_data.extend(cost_basis_rows)
 
     # Benchmark belongs at the end: it is a reference, not a portfolio total.
-    if benchmark_code and total_bench_current > 0:
-        bench_pnl = total_bench_current - total_cost
-        bench_pnl_pct = (bench_pnl / total_cost * 100) if total_cost else 0.0
-        vs_bench = total_current - total_bench_current
-        vs_bench_pct = (vs_bench / total_bench_current * 100) if total_bench_current else 0.0
-        summary_data.append([td(f"Benchmark [{benchmark_code}]"), tdr(f"{total_bench_current:,.0f} TL  ({bench_pnl_pct:+.2f}%)")])
-        vs_bench_str = f"{vs_bench:+,.0f} TL  ({vs_bench_pct:+.2f}%)"
-        summary_data.append([td("vs Benchmark (open positions)"), pnl_para(vs_bench_str, vs_bench)])
+    # It covers every position held so far — closed trades are mirrored into the
+    # benchmark on the same dates — so it answers "what if all of it had gone
+    # into the benchmark instead", not just the part still open.
+    if benchmark_code and total_bench_wealth > 0:
+        summary_data.append([
+            td(f"Benchmark [{benchmark_code}] P&L (all positions)"),
+            pnl_para(f"{bench_pnl_all:+,.0f} TL  ({bench_pnl_all_pct:+.2f}%)",
+                     bench_pnl_all),
+        ])
+        summary_data.append([
+            td("vs Benchmark (all positions)", bold=True),
+            pnl_para(f"{vs_bench_all:+,.0f} TL  ({vs_bench_all_pct:+.2f}%)",
+                     vs_bench_all, bold=True),
+        ])
+        summary_data.append([
+            td("    \u00b7 from open positions"),
+            pnl_para(f"{vs_bench_open:+,.0f} TL", vs_bench_open),
+        ])
+        summary_data.append([
+            td("    \u00b7 from closed positions"),
+            pnl_para(f"{vs_bench_closed:+,.0f} TL", vs_bench_closed),
+        ])
 
     summary_style = [
         ("BACKGROUND",  (0,0), (-1,0), HEADER_BG),
@@ -1407,9 +1688,17 @@ def write_pdf_report(holdings, fund_data, fund_summary,
             ("TOPPADDING", (0,today_return_row), (-1,today_return_row), 5),
             ("BOTTOMPADDING", (0,today_return_row), (-1,today_return_row), 5),
         ])
-    summary_table = Table(summary_data, colWidths=[5*cm, 7*cm])
+    summary_table = Table(summary_data, colWidths=[6.5*cm, 7*cm])
     summary_table.setStyle(TableStyle(summary_style))
     story.append(summary_table)
+    if benchmark_code and bench_self_cost > 0:
+        story.append(Spacer(1, 0.15*cm))
+        story.append(Paragraph(
+            f"Note: [{benchmark_code}] is itself held as a position "
+            f"({bench_self_cost:,.0f} TL, {bench_self_pct:.1f}% of invested). "
+            f"That slice compares against itself, pulling the benchmark gap "
+            f"toward zero.",
+            style("note", 7, color=colors.grey)))
     story.append(Spacer(1, 0.6*cm))
 
     # ── Bank totals table ──
@@ -1897,6 +2186,77 @@ def write_pdf_report(holdings, fund_data, fund_summary,
     if closed_section:
         story.append(Spacer(1, 0.6*cm))
         story.extend(closed_section)
+    # ── Monthly & weekly P&L vs benchmark (newest first) ───────────────────────
+    if period_returns:
+        story.append(PageBreak())
+        story.append(Paragraph("Monthly &amp; Weekly P&amp;L", heading_style))
+        story.append(Spacer(1, 0.2*cm))
+        bench_label = f"{benchmark_code} (%)" if benchmark_code else "Benchmark (%)"
+        period_data = [[th("Period"), th("P&L (TL)"), th("Return (%)"),
+                        th(bench_label), th("Diff (pp)")]]
+        month_rows = []
+        month_beat, month_lag, week_beat, week_lag = [], [], [], []
+
+        def period_cells(label, row, bold=False):
+            bench = row.get("bench_pct")
+            diff = row.get("diff")
+            return [
+                td(label, bold=bold),
+                pnl_para(f"{row['gain']:+,.0f}", row["gain"], bold=bold),
+                pnl_para(f"{row['pct']:+.2f}%", row["pct"], bold=bold),
+                pnl_para(f"{bench:+.2f}%", bench, bold=bold) if bench is not None
+                else td("\u2014", align="RIGHT"),
+                pnl_para(f"{diff:+.2f}", diff, bold=bold) if diff is not None
+                else td("\u2014", align="RIGHT"),
+            ]
+
+        for month_row in period_returns:
+            index = len(period_data)
+            month_rows.append(index)
+            if month_row.get("diff") is not None:
+                (month_beat if month_row["diff"] >= 0 else month_lag).append(index)
+            period_data.append(period_cells(month_row["label"], month_row, bold=True))
+            for week_row in month_row["weeks"]:
+                index = len(period_data)
+                if week_row.get("diff") is not None:
+                    (week_beat if week_row["diff"] >= 0 else week_lag).append(index)
+                period_data.append(period_cells(f"    {week_row['label']}", week_row))
+
+        # Rows are tinted by whether they beat the benchmark. Month rows take the
+        # deeper shade and are ruled top and bottom, so they still read as the
+        # header of their group without a fill colour of their own.
+        MONTH_BEAT_BG = colors.HexColor("#a9d08e")   # deeper green
+        MONTH_LAG_BG  = colors.HexColor("#f4a9a9")   # deeper red
+        WEEK_BEAT_BG  = colors.HexColor("#e2f0d9")   # light green
+        WEEK_LAG_BG   = colors.HexColor("#fbe0e0")   # light red
+        period_style = [
+            ("BACKGROUND",   (0,0), (-1,0), HEADER_BG),
+            ("TEXTCOLOR",    (0,0), (-1,0), colors.white),
+            ("BOX",          (0,0), (-1,-1), 0.5, colors.grey),
+            ("INNERGRID",    (0,0), (-1,-1), 0.3, colors.lightgrey),
+            ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING",   (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 3),
+        ]
+        for rows, fill in ((week_beat, WEEK_BEAT_BG), (week_lag, WEEK_LAG_BG),
+                           (month_beat, MONTH_BEAT_BG), (month_lag, MONTH_LAG_BG)):
+            for r in rows:
+                period_style.append(("BACKGROUND", (0,r), (-1,r), fill))
+        for r in month_rows:
+            period_style.append(("LINEABOVE", (0,r), (-1,r), 1.2, HEADER_BG))
+            period_style.append(("LINEBELOW", (0,r), (-1,r), 1.2, HEADER_BG))
+        period_table = Table(period_data,
+                             colWidths=[4*cm, 3.5*cm, 3*cm, 3*cm, 2.8*cm],
+                             repeatRows=1)
+        period_table.setStyle(TableStyle(period_style))
+        story.append(period_table)
+        story.append(Spacer(1, 0.3*cm))
+        if benchmark_code:
+            story.append(Paragraph(
+                f"Green rows beat [{benchmark_code}] over that period, red rows "
+                f"lagged it. Diff is in percentage points.",
+                style("note", 7, color=colors.grey)))
+
     story.append(Spacer(1, 0.4*cm))
     story.append(Paragraph(
         f"Generated: {today_str} — Data source: tefas.gov.tr",
@@ -1925,7 +2285,8 @@ def send_email(pdf_path, date_str, total_cost, total_current, total_pnl, total_p
     combined_pnl = total_pnl + realized_pnl
     combined_capital = total_cost - realized_pnl
     combined_pnl_pct = (
-        combined_pnl / combined_capital * 100 if combined_capital else 0.0
+        combined_pnl / combined_capital * 100
+        if abs(combined_capital) > 1.0 else 0.0
     )
 
     if not smtp_user or not smtp_pass:
